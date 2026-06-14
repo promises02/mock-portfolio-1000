@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: mock-portfolio-1000
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: VITE_GOOGLE_GEMINI_API_KEY
+        sync: false
+      - key: VITE_ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
