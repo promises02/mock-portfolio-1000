@@ -1,0 +1,53 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128;
+    }
+    
+    function isValidPortfolio(data) {
+      return data.keys().hasAll(['nickname', 'assets', 'savings', 'updatedAt', 'totalCurrentValue', 'profitRate', 'profitAmount', 'hasRealPrices'])
+        && data.nickname is string
+        && data.nickname.size() >= 1
+        && data.nickname.size() <= 50
+        && data.assets is list
+        && (data.savings is int || data.savings is float)
+        && (data.totalCurrentValue is int || data.totalCurrentValue is float)
+        && (data.profitRate is int || data.profitRate is float)
+        && (data.profitAmount is int || data.profitAmount is float)
+        && data.hasRealPrices is bool
+        && (!data.keys().hasAll(['reason']) || (data.reason is string && data.reason.size() <= 1100));
+    }
+    
+    // User portfolios (nickname-based, open for development)
+    match /portfolios/{nickname} {
+      allow read, write: if true;
+    }
+
+    // Market price overrides (admin + realtime sync)
+    match /customPrices/{assetName} {
+      allow read, write: if true;
+    }
+
+    // User-added custom assets (shared catalog)
+    match /customAssets/{assetId} {
+      allow read, write: if true;
+    }
+
+    // Global app settings (exchange rate, etc.)
+    match /settings/{docId} {
+      allow read, write: if true;
+    }
+    
+    // Global Safety Net (모든 다른 경로 차단)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

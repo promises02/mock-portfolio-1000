@@ -1,0 +1,12 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+# Environment variables (민감한 정보)
+.env
+.env.local
+.env.*.local

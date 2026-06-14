@@ -1,0 +1,82 @@
+{
+  "entities": {
+    "Portfolio": {
+      "title": "Portfolio",
+      "description": "Mock investment portfolio representing a 10 million KRW capital allocation with real-time valuation metrics.",
+      "type": "object",
+      "properties": {
+        "nickname": {
+          "type": "string",
+          "description": "The user's nickname/identifier."
+        },
+        "assets": {
+          "type": "array",
+          "description": "List of active investment asset items.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "price": {
+                "type": "number"
+              },
+              "quantity": {
+                "type": "number"
+              },
+              "currentPrice": {
+                "type": "number"
+              },
+              "sourceUrl": {
+                "type": "string"
+              },
+              "searchReasoning": {
+                "type": "string"
+              }
+            },
+            "required": ["name", "price", "quantity"]
+          }
+        },
+        "savings": {
+          "type": "number",
+          "description": "The remaining unallocated cash placed in bank savings/deposit."
+        },
+        "totalCurrentValue": {
+          "type": "number",
+          "description": "Total value of cash and assets combined."
+        },
+        "profitRate": {
+          "type": "number",
+          "description": "Percentage representing profit rate."
+        },
+        "profitAmount": {
+          "type": "number",
+          "description": "Profit amount in KRW."
+        },
+        "hasRealPrices": {
+          "type": "boolean",
+          "description": "Whether real-time prices have been resolved."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Optional portfolio strategy description or investment reason up to 1000 characters."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server updatedAt timestamp."
+        }
+      },
+      "required": ["nickname", "assets", "savings", "totalCurrentValue", "profitRate", "profitAmount", "hasRealPrices", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "portfolios/{nickname}": {
+      "schema": "Portfolio",
+      "description": "Real-time user portfolio documents identified by their unique nickname key."
+    }
+  }
+}

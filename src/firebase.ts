@@ -1,0 +1,2224 @@
+import { initializeApp } from 'firebase/app';
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  setDoc,
+  deleteDoc,
+  onSnapshot,
+  query,
+  where,
+  getFirestore,
+} from 'firebase/firestore';
+import firebaseConfig from '../firebase-applet-config.json';
+import { ALL_PRESETS, getPresetByName } from './presets';
+import { AssetType, AssetMarket, CustomAsset, DisplayCurrency, Portfolio, ValidationResult, BuyRequest, AssetItem, Transaction, BuyAssetError, SellAssetError, SellAssetRequest, SellAssetResult, RealtimePriceQuote, RealtimePriceSnapshot, MarketPriceMap, AdminPriceUpdateReason, AdminExchangeRateUpdateReason, AdminPriceUpdateResult, PurchaseRecord } from './types';
+import { DEFAULT_EXCHANGE_RATE, computeKrwEquivalent, getDefaultDisplayCurrency, inferAssetMarketRegion, enrichAssetCurrencyFields, inferAssetMarket, inferAssetSector } from './utils';
+import {
+  derivePortfolioCash,
+  getPurchaseUnitKrw,
+  getPurchasePriceUsd,
+  resolvePurchaseExchangeRate,
+  calculateUnrealizedProfit,
+  PORTFOLIO_STARTING_CAPITAL,
+  buildUsAssetOnFirstBuy,
+  mergeUsAssetOnBuy,
+  buildCatalogPriceMap,
+  isUsMarketAsset,
+  normalizeUsAssetPurchaseBasis,
+  portfolioCashNeedsRepair,
+  type CatalogPriceMap,
+} from './utils/portfolioPnL';
+export type { CatalogPriceMap } from './utils/portfolioPnL';
+import { GoogleGenAI } from '@google/genai';
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId); /* CRITICAL: The app will break without this line */
+
+export interface UnifiedAsset {
+  name: string;
+  type: AssetType;
+  price: number;
+  priceUSD?: number;
+  priceKRW?: number;
+  priceCrypto?: string;
+  ticker?: string;
+  sector?: string;
+  market?: string;
+  marketRegion?: AssetMarket;
+  displayCurrency?: DisplayCurrency;
+  sourceUrl?: string;
+  isCustom?: boolean;
+}
+
+// Error logging specifications for AI Studio
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  nickname?: string | null;
+}
+
+export function handleFirestoreError(
+  error: unknown,
+  operationType: OperationType,
+  path: string | null,
+  nickname?: string | null
+) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    operationType,
+    path,
+    nickname: nickname ?? null,
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+function sanitizeDocId(value: string): string {
+  return value.replace(/\s+/g, '_').replace(/[/\\.#$[\]]/g, '_');
+}
+
+function stripUndefinedDeep<T>(value: T): T {
+  if (value === undefined) {
+    return value;
+  }
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  if (value instanceof Date) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => stripUndefinedDeep(item)) as T;
+  }
+
+  const input = value as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(input)) {
+    if (nested !== undefined) {
+      result[key] = stripUndefinedDeep(nested);
+    }
+  }
+  return result as T;
+}
+
+function parseGeminiJson(text: string): Record<string, unknown> {
+  let cleanText = text.trim();
+  if (cleanText.startsWith('```')) {
+    cleanText = cleanText.replace(/^```(?:json)?\n?/, '');
+    cleanText = cleanText.replace(/\n?```$/, '');
+    cleanText = cleanText.trim();
+  }
+  return JSON.parse(cleanText) as Record<string, unknown>;
+}
+
+function getGeminiClient(): GoogleGenAI | null {
+  const apiKey = import.meta.env.VITE_GOOGLE_GEMINI_API_KEY;
+  if (!apiKey) return null;
+  return new GoogleGenAI({ apiKey });
+}
+
+export async function validateAsset(
+  assetName: string,
+  market: string,
+  priceInput: string
+): Promise<ValidationResult> {
+  const trimmedName = assetName.trim();
+
+  const failResult = (apiError = true): ValidationResult => ({
+    isValid: false,
+    assetName: trimmedName,
+    confidence: 0,
+    message: '검증 실패. 계속 진행하시겠어요?',
+    apiError,
+  });
+
+  const ai = getGeminiClient();
+  if (!ai) {
+    return failResult(true);
+  }
+
+  const prompt = `${trimmedName}은(는) ${market} 자산인가? 실제로 존재하나? 티커 심볼과 업종을 추정해줘.
+입력된 가격: ${priceInput}
+
+다음 JSON 형식으로만 응답하세요 (마크다운 코드블록이나 추가 설명 없이 JSON만):
+{
+  "isValid": true,
+  "ticker": "MU",
+  "sector": "반도체",
+  "market": "미국 주식",
+  "confidence": 95,
+  "message": "마이크론은 실제 NASDAQ 상장 기업입니다. Ticker: MU, 업종: 반도체"
+}`;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.0-flash',
+      contents: prompt,
+    });
+
+    const responseText = response.text?.trim();
+    if (!responseText) {
+      return failResult(true);
+    }
+
+    const parsed = parseGeminiJson(responseText);
+    const isValid = Boolean(parsed.isValid);
+    const confidence = Math.min(100, Math.max(0, Number(parsed.confidence) || 0));
+    const ticker = typeof parsed.ticker === 'string' && parsed.ticker !== 'null'
+      ? parsed.ticker.trim()
+      : undefined;
+    const sector = typeof parsed.sector === 'string' && parsed.sector !== 'null'
+      ? parsed.sector.trim()
+      : undefined;
+    const confirmedMarket = typeof parsed.market === 'string' ? parsed.market.trim() : market;
+    const message = typeof parsed.message === 'string' && parsed.message.trim()
+      ? parsed.message.trim()
+      : isValid
+        ? `${trimmedName}은(는) 유효한 ${market} 자산으로 확인되었습니다.`
+        : '입력하신 정보를 확인해주세요.';
+
+    return {
+      isValid,
+      assetName: trimmedName,
+      ticker,
+      sector,
+      market: confirmedMarket,
+      confidence,
+      message,
+    };
+  } catch (error) {
+    console.error('Asset validation failed:', error);
+    return failResult(true);
+  }
+}
+
+export async function addCustomAsset(
+  nickname: string,
+  assetName: string,
+  type: CustomAsset['type'],
+  inputPrice: number | string,
+  displayCurrency: DisplayCurrency,
+  ticker?: string,
+  sector?: string,
+  market?: string,
+  sourceUrl?: string,
+  marketRegion?: AssetMarket,
+  isVerified?: boolean,
+  verificationStatus?: string
+): Promise<CustomAsset> {
+  const trimmedName = assetName.trim();
+  const timestamp = Date.now();
+  const id = sanitizeDocId(`${trimmedName}_${nickname}_${timestamp}`);
+  const resolvedMarketRegion =
+    marketRegion ?? inferAssetMarketRegion(trimmedName, type);
+
+  const numericPrice =
+    typeof inputPrice === 'string' ? parseFloat(inputPrice) : inputPrice;
+
+  let priceUSD: number | undefined;
+  let priceKRW: number | undefined;
+  let priceCrypto: string | undefined;
+  let purchasePriceUSD: number | undefined;
+  let purchasePriceKRW: number | undefined;
+  let purchasePriceCrypto: string | undefined;
+
+  if (displayCurrency === 'USD') {
+    priceUSD = numericPrice;
+    purchasePriceUSD = numericPrice;
+  } else if (displayCurrency === 'KRW') {
+    priceKRW = Math.round(numericPrice);
+    purchasePriceKRW = Math.round(numericPrice);
+  } else {
+    priceCrypto = String(inputPrice).trim();
+    purchasePriceCrypto = String(inputPrice).trim();
+  }
+
+  const price = computeKrwEquivalent(displayCurrency, numericPrice, await getGlobalExchangeRate());
+
+  const asset: CustomAsset = {
+    id,
+    name: trimmedName,
+    type,
+    price,
+    quantity: 1,
+    addedBy: nickname,
+    addedAt: new Date(),
+    marketRegion: resolvedMarketRegion,
+    displayCurrency,
+    ...(priceUSD != null ? { priceUSD } : {}),
+    ...(priceKRW != null ? { priceKRW } : {}),
+    ...(priceCrypto != null ? { priceCrypto } : {}),
+    ...(purchasePriceUSD != null ? { purchasePriceUSD } : {}),
+    ...(purchasePriceKRW != null ? { purchasePriceKRW } : {}),
+    ...(purchasePriceCrypto != null ? { purchasePriceCrypto } : {}),
+    ...(ticker?.trim() ? { ticker: ticker.trim() } : {}),
+    ...(sector?.trim() ? { sector: sector.trim() } : {}),
+    ...(market?.trim() ? { market: market.trim() } : {}),
+    ...(sourceUrl?.trim() ? { sourceUrl: sourceUrl.trim() } : {}),
+    ...(isVerified != null ? { isVerified } : {}),
+    ...(verificationStatus?.trim() ? { verificationStatus: verificationStatus.trim() } : {}),
+  };
+
+  await setDoc(doc(db, 'customAssets', id), asset);
+  return asset;
+}
+
+function sanitizeNumeric(value: unknown): number | undefined {
+  if (value == null || value === '') return undefined;
+  const num = typeof value === 'number' ? value : parseFloat(String(value));
+  return Number.isFinite(num) ? num : undefined;
+}
+
+function isSpaceXAsset(name: string): boolean {
+  const normalized = name.trim().toLowerCase();
+  return normalized.includes('스페이스') || normalized.includes('spacex') || normalized.includes('space x');
+}
+
+/** logicalName: assetCardDebugAndCompact — Firestore customAssets NaN/잘못된 가격 보정 */
+export function normalizeCustomAsset(data: CustomAsset, docId: string): CustomAsset {
+  const asset: CustomAsset = { ...data, id: docId };
+  let priceUSD = sanitizeNumeric(asset.priceUSD);
+  let priceKRW = sanitizeNumeric(asset.priceKRW);
+  let price = sanitizeNumeric(asset.price);
+
+  if (isSpaceXAsset(asset.name)) {
+    asset.displayCurrency = asset.displayCurrency ?? 'USD';
+    asset.marketRegion = asset.marketRegion ?? 'US';
+    asset.market = asset.market ?? '미국 주식';
+    priceUSD = priceUSD && priceUSD > 0 ? priceUSD : 106.95;
+    asset.priceUSD = priceUSD;
+    price = Math.round(priceUSD * DEFAULT_EXCHANGE_RATE);
+    if (priceKRW === 160) {
+      delete asset.priceKRW;
+    }
+  } else if (asset.displayCurrency === 'USD' && priceUSD && priceUSD > 0) {
+    price = Math.round(priceUSD * DEFAULT_EXCHANGE_RATE);
+  } else if (priceKRW && priceKRW > 0) {
+    price = Math.round(priceKRW);
+  }
+
+  if (!price || price <= 0 || Number.isNaN(price)) {
+    price =
+      priceKRW && priceKRW > 0
+        ? priceKRW
+        : priceUSD && priceUSD > 0
+          ? Math.round(priceUSD * DEFAULT_EXCHANGE_RATE)
+          : 0;
+  }
+
+  asset.price = Math.round(price);
+  if (priceUSD != null) asset.priceUSD = priceUSD;
+  if (priceKRW != null) asset.priceKRW = priceKRW;
+
+  return asset;
+}
+
+function mapBuyError(error: unknown, context: string): never {
+  console.error(`[buyAsset] ${context}:`, error);
+
+  if (error instanceof BuyAssetError) {
+    throw error;
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+
+  if (message.includes('permission') || message.includes('PERMISSION_DENIED')) {
+    throw new BuyAssetError('다시 시도해주세요. (저장 권한 오류)');
+  }
+  if (message.includes('offline') || message.includes('unavailable')) {
+    throw new BuyAssetError('다시 시도해주세요. (네트워크 연결 오류)');
+  }
+  if (message.includes('undefined') || message.includes('Unsupported field value')) {
+    throw new BuyAssetError('다시 시도해주세요. (데이터 저장 오류)');
+  }
+
+  throw new BuyAssetError('다시 시도해주세요.');
+}
+
+/** logicalName: tickerSearchSupport */
+function matchesAssetSearch(
+  name: string,
+  ticker: string | undefined,
+  searchQueryUpper: string
+): boolean {
+  if (!searchQueryUpper) return false;
+  const nameUpper = name.toUpperCase();
+  const tickerUpper = ticker?.toUpperCase() ?? '';
+  return nameUpper.includes(searchQueryUpper) || tickerUpper.includes(searchQueryUpper);
+}
+
+export async function searchAssets(searchQuery: string): Promise<UnifiedAsset[]> {
+  const queryUpper = searchQuery.trim().toUpperCase();
+  if (!queryUpper) return [];
+
+  const customSnap = await getDocs(collection(db, 'customAssets'));
+  const customResults: (UnifiedAsset & { addedAtMs: number })[] = [];
+
+  customSnap.forEach((docSnap) => {
+    const raw = docSnap.data() as CustomAsset;
+    const data = normalizeCustomAsset(raw, docSnap.id);
+    if (!matchesAssetSearch(data.name ?? '', data.ticker, queryUpper)) return;
+
+    const addedAtMs =
+      data.addedAt instanceof Date
+        ? data.addedAt.getTime()
+        : typeof data.addedAt?.toDate === 'function'
+          ? data.addedAt.toDate().getTime()
+          : typeof data.addedAt === 'number'
+            ? data.addedAt
+            : 0;
+
+    customResults.push({
+      name: data.name,
+      type: data.type as AssetType,
+      price: data.price,
+      priceUSD: data.priceUSD,
+      priceKRW: data.priceKRW,
+      priceCrypto: data.priceCrypto,
+      ticker: data.ticker,
+      sector: data.sector,
+      market: data.market,
+      marketRegion: data.marketRegion ?? inferAssetMarketRegion(data.name, data.type),
+      displayCurrency:
+        data.displayCurrency ??
+        getDefaultDisplayCurrency(
+          data.marketRegion ?? inferAssetMarketRegion(data.name, data.type)
+        ),
+      sourceUrl: data.sourceUrl,
+      isCustom: true,
+      addedAtMs,
+    });
+  });
+
+  customResults.sort((a, b) => b.addedAtMs - a.addedAtMs);
+
+  const presetResults: UnifiedAsset[] = ALL_PRESETS.filter((preset) =>
+    matchesAssetSearch(
+      preset.name,
+      'ticker' in preset ? (preset as { ticker?: string }).ticker : undefined,
+      queryUpper
+    )
+  ).map((preset) => {
+    const marketRegion = inferAssetMarketRegion(preset.name, preset.type);
+    const presetTicker = 'ticker' in preset ? (preset as { ticker?: string }).ticker : undefined;
+    return {
+      name: preset.name,
+      type: preset.type,
+      price: preset.price,
+      ...(presetTicker ? { ticker: presetTicker } : {}),
+      marketRegion,
+      displayCurrency: getDefaultDisplayCurrency(marketRegion),
+      isCustom: false,
+    };
+  });
+
+  const seen = new Set<string>();
+  const merged: UnifiedAsset[] = [];
+
+  for (const asset of customResults) {
+    const key = asset.name.trim().toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const { addedAtMs: _, ...rest } = asset;
+    merged.push(rest);
+  }
+
+  for (const asset of presetResults) {
+    const key = asset.name.trim().toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(asset);
+  }
+
+  return merged.slice(0, 8);
+}
+
+function validateCustomAssetUpdates(updates: Partial<CustomAsset>): void {
+  if (updates.quantity != null && updates.quantity <= 0) {
+    throw new Error('수량은 0보다 커야 합니다.');
+  }
+  if (updates.priceUSD != null && updates.priceUSD <= 0) {
+    throw new Error('현재가(USD)는 0보다 커야 합니다.');
+  }
+  if (updates.priceKRW != null && updates.priceKRW <= 0) {
+    throw new Error('현재가(KRW)는 0보다 커야 합니다.');
+  }
+  if (updates.priceCrypto != null && parseFloat(updates.priceCrypto) <= 0) {
+    throw new Error('현재가(CRYPTO)는 0보다 커야 합니다.');
+  }
+  if (updates.purchasePriceUSD != null && updates.purchasePriceUSD <= 0) {
+    throw new Error('매수가(USD)는 0보다 커야 합니다.');
+  }
+  if (updates.purchasePriceKRW != null && updates.purchasePriceKRW <= 0) {
+    throw new Error('매수가(KRW)는 0보다 커야 합니다.');
+  }
+  if (updates.purchasePriceCrypto != null && parseFloat(updates.purchasePriceCrypto) <= 0) {
+    throw new Error('매수가(CRYPTO)는 0보다 커야 합니다.');
+  }
+  if (updates.price != null && updates.price <= 0) {
+    throw new Error('가격은 0보다 커야 합니다.');
+  }
+}
+
+async function assertCustomAssetOwner(nickname: string, assetId: string): Promise<CustomAsset> {
+  const docRef = doc(db, 'customAssets', assetId);
+  const snap = await getDoc(docRef);
+  if (!snap.exists()) {
+    throw new Error('자산을 찾을 수 없습니다.');
+  }
+  const asset = snap.data() as CustomAsset;
+  if (asset.addedBy !== nickname) {
+    throw new Error('이 자산을 수정할 권한이 없습니다.');
+  }
+  return { ...asset, id: assetId };
+}
+
+function getCustomAssetAddedAtMs(addedAt: CustomAsset['addedAt']): number {
+  if (addedAt instanceof Date) return addedAt.getTime();
+  if (typeof addedAt?.toDate === 'function') return addedAt.toDate().getTime();
+  if (typeof addedAt === 'number') return addedAt;
+  return 0;
+}
+
+function sortCustomAssetsByAddedAt(results: CustomAsset[]): CustomAsset[] {
+  return results.sort(
+    (a, b) => getCustomAssetAddedAtMs(b.addedAt) - getCustomAssetAddedAtMs(a.addedAt)
+  );
+}
+
+/** logicalName: communityCustomAssetMarket — 시장에 등록된 전체 참여자 추가 자산 */
+export async function getAllCommunityCustomAssets(): Promise<CustomAsset[]> {
+  const snap = await getDocs(collection(db, 'customAssets'));
+  const results: CustomAsset[] = [];
+
+  snap.forEach((docSnap) => {
+    const raw = docSnap.data() as CustomAsset;
+    const data = normalizeCustomAsset(raw, docSnap.id);
+    results.push(data);
+  });
+
+  return sortCustomAssetsByAddedAt(results);
+}
+
+/** logicalName: communityCustomAssetMarket — customAssets 실시간 구독 */
+export function subscribeCommunityCustomAssets(
+  onUpdate: (assets: CustomAsset[]) => void,
+  onError?: (error: Error) => void
+): () => void {
+  let collectionAssets: CustomAsset[] = [];
+  let sharedAssets: CustomAsset[] = [];
+
+  const emit = () => {
+    onUpdate(mergeCustomAssetLists(collectionAssets, sharedAssets));
+  };
+
+  const unsubCollection = onSnapshot(
+    collection(db, 'customAssets'),
+    (snapshot) => {
+      collectionAssets = [];
+      snapshot.forEach((docSnap) => {
+        collectionAssets.push(normalizeCustomAsset(docSnap.data() as CustomAsset, docSnap.id));
+      });
+      emit();
+    },
+    (error) => {
+      console.warn('[subscribeCommunityCustomAssets] collection listener error:', error);
+      onError?.(error);
+    }
+  );
+
+  const unsubShared = onSnapshot(
+    sharedConfigRef(),
+    (snapshot) => {
+      const raw = snapshot.data()?.customAssets;
+      sharedAssets = Array.isArray(raw)
+        ? raw.map((item, index) =>
+            normalizeCustomAsset(item as CustomAsset, (item as CustomAsset).id ?? `shared_${index}`)
+          )
+        : [];
+      emit();
+    },
+    (error) => {
+      console.warn('[subscribeCommunityCustomAssets] shared config listener error:', error);
+    }
+  );
+
+  return () => {
+    unsubCollection();
+    unsubShared();
+  };
+}
+
+const PRESET_ASSET_ID_PREFIX = '__preset__';
+
+function presetToAdminAsset(
+  preset: (typeof ALL_PRESETS)[number],
+  marketPrices: MarketPriceMap
+): CustomAsset {
+  const marketRegion = inferAssetMarketRegion(preset.name, preset.type);
+  const displayCurrency = getDefaultDisplayCurrency(marketRegion);
+  const presetTicker = 'ticker' in preset ? (preset as { ticker?: string }).ticker : undefined;
+  const priceOverride = marketPrices[preset.name.trim()];
+
+  let price = preset.price;
+  let priceUSD = preset.usdPrice;
+  let priceKRW = displayCurrency === 'KRW' ? preset.price : undefined;
+
+  if (priceOverride !== undefined) {
+    price = priceOverride;
+    if (displayCurrency === 'KRW') {
+      priceKRW = priceOverride;
+    }
+  }
+
+  return {
+    id: `${PRESET_ASSET_ID_PREFIX}${sanitizeDocId(preset.name)}`,
+    name: preset.name,
+    type: preset.type as CustomAsset['type'],
+    price,
+    priceUSD,
+    priceKRW,
+    ticker: presetTicker,
+    marketRegion,
+    displayCurrency,
+    market:
+      marketRegion === 'Korea'
+        ? '국내 주식'
+        : marketRegion === 'US'
+          ? '미국 주식'
+          : '암호화폐',
+    addedBy: 'system',
+    addedAt: new Date(0),
+  };
+}
+
+function applyMarketPriceOverride(asset: CustomAsset, marketPrices: MarketPriceMap): CustomAsset {
+  const override = marketPrices[asset.name.trim()];
+  if (override === undefined) return asset;
+
+  const displayCurrency =
+    asset.displayCurrency ?? getDefaultDisplayCurrency(asset.marketRegion ?? 'Korea');
+
+  if (displayCurrency === 'KRW') {
+    return { ...asset, price: override, priceKRW: override };
+  }
+
+  return { ...asset, price: override };
+}
+
+/** logicalName: newAdminModeAssetPriceEditor — 프리셋 + customAssets 전체 목록 */
+export function buildAdminAssetList(
+  customAssets: CustomAsset[],
+  marketPrices: MarketPriceMap = {}
+): CustomAsset[] {
+  const byName = new Map<string, CustomAsset>();
+
+  for (const asset of customAssets) {
+    byName.set(
+      asset.name.trim().toLowerCase(),
+      applyMarketPriceOverride(asset, marketPrices)
+    );
+  }
+
+  for (const preset of ALL_PRESETS) {
+    const key = preset.name.trim().toLowerCase();
+    if (byName.has(key)) continue;
+    byName.set(key, presetToAdminAsset(preset, marketPrices));
+  }
+
+  return Array.from(byName.values()).sort((a, b) =>
+    a.name.localeCompare(b.name, 'ko')
+  );
+}
+
+export async function getAllAdminAssets(
+  marketPrices: MarketPriceMap = {}
+): Promise<CustomAsset[]> {
+  const customAssets = await getAllCommunityCustomAssets();
+  return buildAdminAssetList(customAssets, marketPrices);
+}
+
+/** logicalName: assetEditDeleteFeature */
+export async function getUserCustomAssets(nickname: string): Promise<CustomAsset[]> {
+  const q = query(collection(db, 'customAssets'), where('addedBy', '==', nickname));
+  const snap = await getDocs(q);
+  const results: CustomAsset[] = [];
+
+  snap.forEach((docSnap) => {
+    const raw = docSnap.data() as CustomAsset;
+    const data = normalizeCustomAsset(raw, docSnap.id);
+    if (data.hiddenByOwner) return;
+    results.push(data);
+  });
+
+  return sortCustomAssetsByAddedAt(results);
+}
+
+export async function editAsset(
+  nickname: string,
+  assetId: string,
+  updates: Partial<CustomAsset>
+): Promise<void> {
+  validateCustomAssetUpdates(updates);
+  const existing = await assertCustomAssetOwner(nickname, assetId);
+
+  const displayCurrency =
+    updates.displayCurrency ?? existing.displayCurrency ?? getDefaultDisplayCurrency(existing.marketRegion ?? 'Korea');
+
+  let price = updates.price ?? existing.price;
+  if (displayCurrency === 'USD' && updates.priceUSD != null) {
+    price = computeKrwEquivalent('USD', updates.priceUSD, DEFAULT_EXCHANGE_RATE);
+  } else if (displayCurrency === 'KRW' && updates.priceKRW != null) {
+    price = updates.priceKRW;
+  } else if (displayCurrency === 'CRYPTO' && updates.priceCrypto != null) {
+    price = computeKrwEquivalent('CRYPTO', parseFloat(updates.priceCrypto), DEFAULT_EXCHANGE_RATE);
+  }
+
+  const { id: _id, ...restUpdates } = updates;
+  const payload: Partial<CustomAsset> = {
+    ...restUpdates,
+    price,
+  };
+
+  try {
+    await setDoc(doc(db, 'customAssets', assetId), payload, { merge: true });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `customAssets/${assetId}`, nickname);
+  }
+}
+
+export async function deleteAsset(nickname: string, assetId: string): Promise<void> {
+  await assertCustomAssetOwner(nickname, assetId);
+  try {
+    await setDoc(
+      doc(db, 'customAssets', assetId),
+      { hiddenByOwner: true },
+      { merge: true }
+    );
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `customAssets/${assetId}`, nickname);
+  }
+}
+
+function createBuyPurchaseRecord(options: {
+  assetId: string;
+  quantity: number;
+  pricePerUnit: number;
+  amountInKrw: number;
+  isUsBuy: boolean;
+  exchangeRate: number;
+}): PurchaseRecord {
+  const { assetId, quantity, pricePerUnit, amountInKrw, isUsBuy, exchangeRate } = options;
+  return {
+    id: `${Date.now()}_buy_${sanitizeDocId(assetId)}`,
+    type: 'BUY',
+    quantity,
+    price: pricePerUnit,
+    amount: isUsBuy ? pricePerUnit : amountInKrw,
+    exchangeRateAtTransaction: isUsBuy ? exchangeRate : undefined,
+    amountInKRW: amountInKrw,
+    timestamp: new Date(),
+    date: new Date().toISOString().slice(0, 10),
+  };
+}
+
+/** logicalName: buyAssetAveragePriceFixUSD */
+function resolveUsBuyAmounts(
+  pricePerUnit: number,
+  quantity: number,
+  totalAmount: number,
+  displayCurrency: 'USD' | 'KRW',
+  exchangeRate: number,
+  isUsBuy: boolean
+): { priceUsd: number; priceKrw: number; amountInKrw: number } {
+  if (!isUsBuy) {
+    const priceKrw = Math.round(pricePerUnit);
+    const amountInKrw = Math.round(totalAmount);
+    return { priceUsd: 0, priceKrw, amountInKrw };
+  }
+
+  const priceUsd =
+    displayCurrency === 'USD' ? pricePerUnit : exchangeRate > 0 ? pricePerUnit / exchangeRate : 0;
+  const priceKrw = Math.round(priceUsd * exchangeRate);
+  const amountInKrw = Math.round(priceUsd * exchangeRate * quantity);
+
+  const expectedKrw =
+    displayCurrency === 'USD'
+      ? Math.round(pricePerUnit * exchangeRate * quantity)
+      : Math.round(totalAmount);
+
+  if (Math.abs(expectedKrw - totalAmount) > quantity && displayCurrency === 'USD') {
+    console.warn('[buyAsset] totalAmount KRW mismatch, using computed value', {
+      totalAmount,
+      expectedKrw,
+      amountInKrw,
+    });
+  }
+
+  return {
+    priceUsd,
+    priceKrw,
+    amountInKrw: displayCurrency === 'USD' ? amountInKrw : Math.round(totalAmount),
+  };
+}
+
+/** logicalName: tradingSystemPhase5 | assetCardDebugAndCompact | buyAssetAveragePriceFixUSD */
+export async function buyAsset(nickname: string, request: BuyRequest): Promise<void> {
+  const trimmedNickname = nickname?.trim();
+  const { assetId, assetName, quantity, pricePerUnit, totalAmount, displayCurrency, ticker } = request;
+
+  console.info('[buyAsset] start', {
+    nickname: trimmedNickname,
+    assetId,
+    assetName,
+    quantity,
+    pricePerUnit,
+    totalAmount,
+    displayCurrency,
+  });
+
+  if (!trimmedNickname) {
+    console.error('[buyAsset] invalid nickname:', nickname);
+    throw new BuyAssetError('다시 시도해주세요.');
+  }
+  if (!assetId?.trim()) {
+    console.error('[buyAsset] missing assetId');
+    throw new BuyAssetError('자산을 찾을 수 없습니다.');
+  }
+  if (!assetName?.trim()) {
+    console.error('[buyAsset] missing assetName');
+    throw new BuyAssetError('자산을 찾을 수 없습니다.');
+  }
+  if (!Number.isFinite(quantity) || Number.isNaN(quantity) || quantity <= 0) {
+    console.error('[buyAsset] invalid quantity:', quantity);
+    throw new BuyAssetError('수량은 0보다 커야 합니다.');
+  }
+  if (!Number.isFinite(pricePerUnit) || Number.isNaN(pricePerUnit) || pricePerUnit <= 0) {
+    console.error('[buyAsset] invalid pricePerUnit:', pricePerUnit);
+    throw new BuyAssetError('다시 시도해주세요. (가격 오류)');
+  }
+  if (!Number.isFinite(totalAmount) || Number.isNaN(totalAmount) || totalAmount <= 0) {
+    console.error('[buyAsset] invalid totalAmount:', totalAmount);
+    throw new BuyAssetError('다시 시도해주세요. (금액 계산 오류)');
+  }
+
+  const docRef = doc(db, 'portfolios', trimmedNickname);
+  let snap;
+  try {
+    snap = await getDoc(docRef);
+  } catch (error) {
+    mapBuyError(error, 'portfolio read failed');
+  }
+
+  const rate = await getGlobalExchangeRate();
+  const portfolio: Portfolio = snap!.exists()
+    ? ({ nickname: trimmedNickname, ...snap!.data() } as Portfolio)
+    : createPortfolio(trimmedNickname, rate);
+
+  const cumulativeProfit = portfolio.cumulativeRealizedProfit ?? 0;
+  const currentAssets = portfolio.assets ?? [];
+  const previousSavings = derivePortfolioCash(
+    currentAssets,
+    cumulativeProfit,
+    portfolio.savings,
+    rate
+  );
+
+  const trimmedName = assetName.trim();
+  const preset = getPresetByName(trimmedName.toLowerCase());
+  const inferredType = preset?.type ?? 'stock';
+  const inferredRegion = inferAssetMarketRegion(trimmedName, inferredType);
+  const isUsBuy = displayCurrency === 'USD' || inferredRegion === 'US';
+  const { priceUsd, priceKrw, amountInKrw } = resolveUsBuyAmounts(
+    pricePerUnit,
+    quantity,
+    totalAmount,
+    displayCurrency,
+    rate,
+    isUsBuy
+  );
+
+  if (!isUsBuy) {
+    const expectedTotal = Math.round(pricePerUnit * quantity);
+    if (Math.abs(expectedTotal - totalAmount) > 1) {
+      console.warn('[buyAsset] totalAmount mismatch', { expectedTotal, totalAmount });
+    }
+  } else if (!Number.isFinite(priceUsd) || priceUsd <= 0) {
+    console.error('[buyAsset] invalid priceUsd:', priceUsd);
+    throw new BuyAssetError('다시 시도해주세요. (USD 가격 오류)');
+  }
+
+  console.info('[buyAsset] portfolio state', {
+    previousSavings,
+    amountInKrw,
+    priceUsd: isUsBuy ? priceUsd : undefined,
+    purchaseExchangeRate: isUsBuy ? rate : undefined,
+    assetCount: currentAssets.length,
+  });
+
+  if (amountInKrw > previousSavings) {
+    console.error('[buyAsset] insufficient cash', { amountInKrw, previousSavings });
+    throw new BuyAssetError('현금이 부족합니다.');
+  }
+
+  if (!Number.isFinite(priceKrw) || priceKrw <= 0) {
+    console.error('[buyAsset] invalid priceKrw conversion:', priceKrw);
+    throw new BuyAssetError('다시 시도해주세요. (환율 변환 오류)');
+  }
+
+  const existingIndex = currentAssets.findIndex(
+    (a) => a.name.trim().toLowerCase() === trimmedName.toLowerCase()
+  );
+
+  const buyRecord = createBuyPurchaseRecord({
+    assetId: assetId.trim(),
+    quantity,
+    pricePerUnit: isUsBuy ? priceUsd : priceKrw,
+    amountInKrw,
+    isUsBuy,
+    exchangeRate: rate,
+  });
+
+  let nextAssets: AssetItem[];
+  if (existingIndex >= 0) {
+    const existing = currentAssets[existingIndex];
+    if (isUsBuy) {
+      const merged = mergeUsAssetOnBuy(existing, quantity, priceKrw, priceUsd, rate);
+      nextAssets = currentAssets.map((asset, index) =>
+        index === existingIndex
+          ? stripUndefinedDeep({
+              ...asset,
+              ...merged,
+              displayCurrency: 'USD' as const,
+              market: asset.market ?? 'US',
+              purchaseHistory: [...(existing.purchaseHistory ?? []), buyRecord],
+            })
+          : stripUndefinedDeep(asset)
+      );
+    } else {
+      const newQty = existing.quantity + quantity;
+      const newAvgPrice = Math.round(
+        (existing.price * existing.quantity + priceKrw * quantity) / newQty
+      );
+      const totalPurchaseAmount = Math.round(newAvgPrice * newQty);
+      nextAssets = currentAssets.map((asset, index) =>
+        index === existingIndex
+          ? stripUndefinedDeep({
+              ...asset,
+              quantity: newQty,
+              price: newAvgPrice,
+              currentPrice: priceKrw,
+              totalPurchaseAmount,
+              priceKRW: pricePerUnit,
+              displayCurrency: 'KRW' as const,
+              purchaseHistory: [...(existing.purchaseHistory ?? []), buyRecord],
+            })
+          : stripUndefinedDeep(asset)
+      );
+    }
+  } else if (isUsBuy) {
+    const usFields = buildUsAssetOnFirstBuy(priceKrw, priceUsd, rate, quantity);
+    nextAssets = [
+      ...currentAssets.map((asset) => stripUndefinedDeep(asset)),
+      stripUndefinedDeep({
+        name: trimmedName,
+        type: inferredType,
+        quantity,
+        market: 'US' as AssetMarket,
+        displayCurrency: 'USD' as const,
+        marketGroup: inferAssetMarket(trimmedName, inferredType),
+        sector: inferAssetSector(trimmedName, inferredType),
+        purchaseHistory: [buyRecord],
+        ...usFields,
+      }),
+    ];
+  } else {
+    nextAssets = [
+      ...currentAssets.map((asset) => stripUndefinedDeep(asset)),
+      stripUndefinedDeep(
+        enrichAssetCurrencyFields(
+          {
+            name: trimmedName,
+            type: inferredType,
+            price: priceKrw,
+            quantity,
+            currentPrice: priceKrw,
+            totalPurchaseAmount: amountInKrw,
+            market: inferredRegion,
+            displayCurrency: 'KRW' as const,
+            priceKRW: pricePerUnit,
+            marketGroup: inferAssetMarket(trimmedName, inferredType),
+            sector: inferAssetSector(trimmedName, inferredType),
+            purchaseHistory: [buyRecord],
+          },
+          rate
+        )
+      ),
+    ];
+  }
+
+  const newSavings = derivePortfolioCash(nextAssets, cumulativeProfit, undefined, rate);
+
+  const sharedSnap = await getDoc(sharedConfigRef());
+  const marketPrices = parseSharedMarketPrices(sharedSnap.data());
+  const catalogPrices = buildCatalogPriceMap([], rate);
+  const initialCapital = resolveInitialCapital(portfolio);
+  const portfolioValues = updatePortfolioValues(
+    nextAssets,
+    newSavings,
+    initialCapital,
+    marketPrices,
+    rate,
+    catalogPrices
+  );
+  const hasRealPrices = portfolioValues.assets.some((a) => a.currentPrice !== a.price);
+
+  const transaction: Transaction = stripUndefinedDeep({
+    id: buyRecord.id,
+    assetName: trimmedName,
+    type: 'BUY',
+    quantity,
+    price: isUsBuy ? Math.round(priceUsd * 100) / 100 : priceKrw,
+    totalAmount: amountInKrw,
+    ...(isUsBuy
+      ? {
+          exchangeRateAtPurchase: rate,
+          amountInKRW: amountInKrw,
+        }
+      : {}),
+    transactionDate: buyRecord.date,
+    timestamp: new Date(),
+  });
+
+  const existingTransactions = (portfolio.transactions ?? []).map((item) =>
+    stripUndefinedDeep({
+      ...item,
+      timestamp:
+        item.timestamp instanceof Date
+          ? item.timestamp
+          : typeof item.timestamp?.toDate === 'function'
+            ? item.timestamp.toDate()
+            : item.timestamp,
+    })
+  );
+
+  try {
+    await setDoc(
+      docRef,
+      stripUndefinedDeep({
+        nickname: trimmedNickname,
+        assets: portfolioValues.assets,
+        savings: newSavings,
+        exchangeRate: rate,
+        initialCapital,
+        totalCurrentValue: portfolioValues.totalCurrentValue,
+        profitAmount: portfolioValues.profitAmount,
+        profitRate: portfolioValues.profitRate,
+        totalAssets: portfolioValues.totalAssets,
+        totalProfitAmount: portfolioValues.totalProfitAmount,
+        totalProfitRate: portfolioValues.totalProfitRate,
+        totalPurchaseAmount: portfolioValues.totalPurchaseAmount,
+        unrealizedProfitAmount: portfolioValues.profitAmount,
+        hasRealPrices: portfolio.hasRealPrices ?? hasRealPrices,
+        transactions: [...existingTransactions, transaction],
+        updatedAt: new Date(),
+        totalBudget: PORTFOLIO_STARTING_CAPITAL + cumulativeProfit,
+        cumulativeRealizedProfit: cumulativeProfit,
+        ...(portfolio.reason != null ? { reason: portfolio.reason } : {}),
+      }),
+      { merge: true }
+    );
+    console.info('[buyAsset] portfolio updated', {
+      nickname: trimmedNickname,
+      newSavings,
+      totalAssets: portfolioValues.totalAssets,
+      totalProfitRate: portfolioValues.totalProfitRate,
+    });
+  } catch (error) {
+    mapBuyError(error, 'portfolio write failed');
+  }
+
+  try {
+    const customDocId = sanitizeDocId(assetId.trim());
+    const customRef = doc(db, 'customAssets', customDocId);
+    const customSnap = await getDoc(customRef);
+    const inferredMarket = inferAssetMarket(trimmedName, inferredType);
+
+    if (customSnap.exists()) {
+      const existingCustom = normalizeCustomAsset(customSnap.data() as CustomAsset, customDocId);
+      await setDoc(
+        customRef,
+        stripUndefinedDeep({
+          name: trimmedName,
+          price: priceKrw,
+          ...(displayCurrency === 'KRW' ? { priceKRW: pricePerUnit } : {}),
+          ...(displayCurrency === 'USD' ? { priceUSD: pricePerUnit } : {}),
+          quantity: (existingCustom.quantity ?? 0) + quantity,
+          ...(ticker ? { ticker } : {}),
+        }),
+        { merge: true }
+      );
+    } else {
+      await setDoc(
+        customRef,
+        stripUndefinedDeep({
+          id: customDocId,
+          name: trimmedName,
+          type: inferredType,
+          price: priceKrw,
+          ...(displayCurrency === 'KRW' ? { priceKRW: pricePerUnit } : {}),
+          ...(displayCurrency === 'USD' ? { priceUSD: pricePerUnit } : {}),
+          displayCurrency: displayCurrency === 'USD' ? 'USD' : 'KRW',
+          marketRegion: inferredRegion,
+          market: inferredMarket,
+          addedBy: trimmedNickname,
+          quantity,
+          addedAt: new Date(),
+          ...(ticker ? { ticker } : {}),
+        } as CustomAsset)
+      );
+    }
+    console.info('[buyAsset] customAsset updated', { assetId: customDocId });
+  } catch (error) {
+    console.error('[buyAsset] customAsset write failed (portfolio already saved):', error);
+  }
+}
+
+function mapSellError(error: unknown, context: string): never {
+  console.error(`[sellAsset] ${context}:`, error);
+  if (error instanceof SellAssetError) throw error;
+  if (error instanceof Error && error.message.includes('offline')) {
+    throw new SellAssetError('네트워크 연결을 확인해 주세요.');
+  }
+  throw new SellAssetError('매도 처리 중 오류가 발생했습니다. 다시 시도해 주세요.');
+}
+
+/** logicalName: totalProfitRateCalculationFix — 초기 자본 (레거시 포트폴리오 fallback) */
+export function resolveInitialCapital(portfolio?: Pick<Portfolio, 'initialCapital'> | null): number {
+  return portfolio?.initialCapital != null && portfolio.initialCapital > 0
+    ? portfolio.initialCapital
+    : PORTFOLIO_STARTING_CAPITAL;
+}
+
+/** logicalName: totalProfitRateCalculationFix — 신규 포트폴리오 초기 문서 */
+export function createPortfolio(nickname: string, exchangeRate: number = DEFAULT_EXCHANGE_RATE): Portfolio {
+  const initialCapital = PORTFOLIO_STARTING_CAPITAL;
+  return {
+    nickname,
+    assets: [],
+    savings: initialCapital,
+    exchangeRate,
+    lastExchangeRateUpdate: new Date(),
+    initialCapital,
+    totalCurrentValue: 0,
+    profitAmount: 0,
+    profitRate: 0,
+    totalAssets: initialCapital,
+    totalProfitAmount: 0,
+    totalProfitRate: 0,
+    totalPurchaseAmount: 0,
+    cumulativeRealizedProfit: 0,
+    totalBudget: initialCapital,
+    hasRealPrices: false,
+    updatedAt: new Date(),
+  };
+}
+
+export interface PortfolioValueUpdate {
+  assets: AssetItem[];
+  totalCurrentValue: number;
+  profitAmount: number;
+  profitRate: number;
+  totalAssets: number;
+  totalProfitAmount: number;
+  totalProfitRate: number;
+  totalPurchaseAmount: number;
+}
+
+/** logicalName: realizedProfitWithCashFlowFixed — 미실현·실현 손익 계산 (re-export) */
+export { calculateUnrealizedProfit, buildCatalogPriceMap } from './utils/portfolioPnL';
+
+export interface RealizedProfitOnSell {
+  sellAmount: number;
+  purchaseAmount: number;
+  realizedProfit: number;
+  profitRate: number;
+  cashInflow: number;
+  purchasePriceKrw: number;
+  purchaseUsd?: number;
+  purchaseRate?: number;
+  sellPriceUsd?: number;
+  isUsAsset: boolean;
+}
+
+/** logicalName: realizedProfitWithCashFlowFixed — 매도 실현 손익 + 현금 유입 */
+export function computeRealizedProfitOnSell(
+  asset: AssetItem,
+  sellQuantity: number,
+  sellPriceKrw: number,
+  exchangeRate: number
+): RealizedProfitOnSell {
+  const market = asset.market ?? inferAssetMarketRegion(asset.name, asset.type || 'stock');
+  const qty = Math.max(0, Math.floor(sellQuantity));
+
+  if (market === 'US') {
+    const purchaseUsd = getPurchasePriceUsd(asset, exchangeRate);
+    const purchaseRate = resolvePurchaseExchangeRate(asset, exchangeRate);
+    const sellPriceUsd = exchangeRate > 0 ? sellPriceKrw / exchangeRate : 0;
+    const purchasePriceKrw = Math.round(purchaseUsd * purchaseRate);
+    const sellAmount = Math.round(sellPriceKrw * qty);
+    const purchaseAmount = Math.round(purchaseUsd * purchaseRate * qty);
+    const realizedProfit = sellAmount - purchaseAmount;
+    const profitRate = purchaseAmount > 0 ? (realizedProfit / purchaseAmount) * 100 : 0;
+
+    return {
+      sellAmount,
+      purchaseAmount,
+      realizedProfit,
+      profitRate,
+      cashInflow: sellAmount,
+      purchasePriceKrw,
+      purchaseUsd,
+      purchaseRate,
+      sellPriceUsd,
+      isUsAsset: true,
+    };
+  }
+
+  const purchasePriceKrw =
+    market === 'Crypto' && asset.quantity > 0 && asset.totalPurchaseAmount
+      ? Math.round(asset.totalPurchaseAmount / asset.quantity)
+      : getPurchaseUnitKrw(asset, exchangeRate);
+  const sellAmount = Math.round(sellPriceKrw * qty);
+  const purchaseAmount = Math.round(purchasePriceKrw * qty);
+  const realizedProfit = sellAmount - purchaseAmount;
+  const profitRate = purchaseAmount > 0 ? (realizedProfit / purchaseAmount) * 100 : 0;
+
+  return {
+    sellAmount,
+    purchaseAmount,
+    realizedProfit,
+    profitRate,
+    cashInflow: sellAmount,
+    purchasePriceKrw,
+    isUsAsset: false,
+  };
+}
+
+/** logicalName: totalProfitRateCalculationFix — 포트폴리오 평가·손익 일괄 계산 */
+export function updatePortfolioValues(
+  assets: AssetItem[],
+  savings: number,
+  initialCapital: number,
+  marketPrices: MarketPriceMap | undefined,
+  exchangeRate: number,
+  catalogPrices?: CatalogPriceMap
+): PortfolioValueUpdate {
+  let totalCurrentValue = 0;
+  let totalPurchaseAmountKRW = 0;
+  let totalUnrealizedProfit = 0;
+
+  const normalizedAssets = assets.map((asset) =>
+    isUsMarketAsset(asset) ? normalizeUsAssetPurchaseBasis(asset, exchangeRate) : asset
+  );
+
+  const updatedAssets = normalizedAssets.map((asset) => {
+    const profitInfo = calculateUnrealizedProfit(asset, marketPrices, exchangeRate, catalogPrices);
+    totalCurrentValue += profitInfo.currentAmount;
+    totalUnrealizedProfit += profitInfo.unrealizedProfit;
+    totalPurchaseAmountKRW += profitInfo.purchaseAmount;
+
+    return stripUndefinedDeep({
+      ...asset,
+      unrealizedProfit: profitInfo.unrealizedProfit,
+      unrealizedProfitRate: profitInfo.unrealizedProfitRate,
+      totalPurchaseAmount: profitInfo.purchaseAmount,
+    });
+  });
+
+  const roundedEvaluation = Math.round(totalCurrentValue);
+  const roundedSavings = Math.round(savings);
+  const totalAssets = roundedSavings + roundedEvaluation;
+  const totalProfitAmount = totalAssets - initialCapital;
+  const totalProfitRate = initialCapital > 0 ? (totalProfitAmount / initialCapital) * 100 : 0;
+  const profitRate =
+    totalPurchaseAmountKRW > 0 ? (totalUnrealizedProfit / totalPurchaseAmountKRW) * 100 : 0;
+
+  return {
+    assets: updatedAssets,
+    totalCurrentValue: roundedEvaluation,
+    profitAmount: Math.round(totalUnrealizedProfit),
+    profitRate,
+    totalAssets,
+    totalProfitAmount,
+    totalProfitRate,
+    totalPurchaseAmount: Math.round(totalPurchaseAmountKRW),
+  };
+}
+
+/** 종합 실질 수익률: (현금 + 평가금액) − 초기자본 */
+export function computeOverallPortfolioReturn(
+  savings: number,
+  assetEvaluation: number,
+  initialCapital: number = PORTFOLIO_STARTING_CAPITAL
+): { totalAssets: number; profitAmount: number; profitRate: number } {
+  const totalAssets = Math.round(savings + assetEvaluation);
+  const profitAmount = totalAssets - initialCapital;
+  const profitRate = initialCapital > 0 ? (profitAmount / initialCapital) * 100 : 0;
+  return { totalAssets, profitAmount, profitRate };
+}
+
+/** logicalName: tradingSystemPhase5 — 포트폴리오 Firestore 저장 (매수/매도 후 자동 반영) */
+export async function persistPortfolio(options: {
+  nickname: string;
+  assets: AssetItem[];
+  reason?: string;
+  cumulativeRealizedProfit?: number;
+  marketPrices?: MarketPriceMap;
+  exchangeRate?: number;
+  catalogPrices?: CatalogPriceMap;
+  /** 저장할 현금 — 미전달 시 보유 매입원가 기준으로 자동 산출 */
+  savings?: number;
+}): Promise<{ assets: AssetItem[]; savings: number; cumulativeRealizedProfit: number }> {
+  const trimmedNickname = options.nickname.trim();
+  if (!trimmedNickname) {
+    throw new Error('닉네임이 필요합니다.');
+  }
+
+  const reason = options.reason ?? '';
+  const cumulativeRealizedProfit = options.cumulativeRealizedProfit ?? 0;
+  const marketPrices = options.marketPrices ?? {};
+  const exchangeRate = options.exchangeRate ?? DEFAULT_EXCHANGE_RATE;
+  const activeTotalBudget = PORTFOLIO_STARTING_CAPITAL + cumulativeRealizedProfit;
+
+  const existingSnap = await getDoc(doc(db, 'portfolios', trimmedNickname));
+  const existingPortfolio = existingSnap.exists()
+    ? ({ nickname: trimmedNickname, ...existingSnap.data() } as Portfolio)
+    : null;
+  const initialCapital = resolveInitialCapital(existingPortfolio);
+
+  const cleanAssets = options.assets.filter(
+    (a) => a.name.trim() !== '' && a.price > 0 && a.quantity > 0
+  );
+
+  const normalizedAssets = cleanAssets.map((asset) =>
+    isUsMarketAsset(asset) ? normalizeUsAssetPurchaseBasis(asset, exchangeRate) : asset
+  );
+
+  const catalogPrices = options.catalogPrices ?? buildCatalogPriceMap([], exchangeRate);
+
+  const assetsWithRealPrices = normalizedAssets.map((asset) => {
+    const activeCurrentPrice =
+      marketPrices[asset.name.trim()] !== undefined
+        ? marketPrices[asset.name.trim()]
+        : (asset.currentPrice ?? asset.price);
+    return stripUndefinedDeep({
+      ...asset,
+      currentPrice: activeCurrentPrice,
+      sourceUrl: asset.sourceUrl || '',
+      searchReasoning: asset.searchReasoning || '',
+    });
+  });
+
+  const hasRealPrices = assetsWithRealPrices.some((a) => a.currentPrice !== a.price);
+  const cleanSavings = derivePortfolioCash(
+    normalizedAssets,
+    cumulativeRealizedProfit,
+    undefined,
+    exchangeRate
+  );
+  const portfolioValues = updatePortfolioValues(
+    assetsWithRealPrices,
+    cleanSavings,
+    initialCapital,
+    marketPrices,
+    exchangeRate,
+    catalogPrices
+  );
+
+  await setDoc(
+    doc(db, 'portfolios', trimmedNickname),
+    stripUndefinedDeep({
+      nickname: trimmedNickname,
+      assets: portfolioValues.assets,
+      savings: cleanSavings,
+      exchangeRate,
+      initialCapital,
+      totalCurrentValue: portfolioValues.totalCurrentValue,
+      profitAmount: portfolioValues.profitAmount,
+      profitRate: portfolioValues.profitRate,
+      totalAssets: portfolioValues.totalAssets,
+      totalProfitAmount: portfolioValues.totalProfitAmount,
+      totalProfitRate: portfolioValues.totalProfitRate,
+      totalPurchaseAmount: portfolioValues.totalPurchaseAmount,
+      unrealizedProfitAmount: portfolioValues.profitAmount,
+      hasRealPrices,
+      updatedAt: new Date(),
+      reason: reason.trim(),
+      totalBudget: activeTotalBudget,
+      cumulativeRealizedProfit,
+    }),
+    { merge: true }
+  );
+
+  return {
+    assets: portfolioValues.assets,
+    savings: cleanSavings,
+    cumulativeRealizedProfit,
+  };
+}
+
+/** Firestore savings가 역산값과 다를 때 손익·예치금 필드 일괄 보정 (기존·신규 계정 공통) */
+export async function repairPortfolioIfNeeded(
+  nickname: string,
+  options?: {
+    marketPrices?: MarketPriceMap;
+    exchangeRate?: number;
+    catalogPrices?: CatalogPriceMap;
+  }
+): Promise<boolean> {
+  const trimmedNickname = nickname.trim();
+  if (!trimmedNickname) return false;
+
+  const snap = await getDoc(doc(db, 'portfolios', trimmedNickname));
+  if (!snap.exists()) return false;
+
+  const portfolio = { nickname: trimmedNickname, ...snap.data() } as Portfolio;
+  const exchangeRate =
+    options?.exchangeRate != null && options.exchangeRate > 0
+      ? options.exchangeRate
+      : await getGlobalExchangeRate();
+
+  if (!portfolioCashNeedsRepair(portfolio, exchangeRate)) {
+    return false;
+  }
+
+  await persistPortfolio({
+    nickname: trimmedNickname,
+    assets: portfolio.assets ?? [],
+    reason: portfolio.reason ?? '',
+    cumulativeRealizedProfit: portfolio.cumulativeRealizedProfit ?? 0,
+    marketPrices: options?.marketPrices ?? {},
+    exchangeRate,
+    catalogPrices: options?.catalogPrices,
+  });
+
+  return true;
+}
+
+/** logicalName: realizedProfitWithCashFlowFixed — enhancedSellSimulator */
+export async function sellAsset(
+  nickname: string,
+  request: SellAssetRequest
+): Promise<SellAssetResult> {
+  const trimmedNickname = nickname.trim();
+  const trimmedName = request.assetName.trim();
+  const quantity = Math.floor(request.quantity);
+  const sellPriceKrw = Math.round(request.sellPriceKrw);
+
+  if (!trimmedNickname) throw new SellAssetError('닉네임이 필요합니다.');
+  if (!trimmedName) throw new SellAssetError('매도할 종목을 선택해 주세요.');
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    throw new SellAssetError('매도 수량은 1 이상의 정수여야 합니다.');
+  }
+  if (!Number.isFinite(sellPriceKrw) || sellPriceKrw <= 0) {
+    throw new SellAssetError('현재가 정보가 유효하지 않습니다.');
+  }
+
+  const docRef = doc(db, 'portfolios', trimmedNickname);
+  let snap;
+  try {
+    snap = await getDoc(docRef);
+  } catch (error) {
+    mapSellError(error, 'portfolio read failed');
+  }
+
+  if (!snap!.exists()) {
+    throw new SellAssetError('포트폴리오를 찾을 수 없습니다.');
+  }
+
+  const portfolio = { nickname: trimmedNickname, ...snap!.data() } as Portfolio;
+  const currentAssets = portfolio.assets ?? [];
+  const assetIndex = currentAssets.findIndex(
+    (a) => a.name.trim().toLowerCase() === trimmedName.toLowerCase()
+  );
+
+  if (assetIndex < 0) {
+    throw new SellAssetError('보유하고 있지 않은 자산은 매도할 수 없습니다.');
+  }
+
+  const existing = currentAssets[assetIndex];
+  const heldQty = Math.floor(existing.quantity);
+
+  if (heldQty <= 0) {
+    throw new SellAssetError('보유 수량이 없습니다.');
+  }
+  if (quantity > heldQty) {
+    throw new SellAssetError(`보유 수량(${heldQty}주)을 초과하여 매도할 수 없습니다.`);
+  }
+
+  const exchangeRate = await getGlobalExchangeRate();
+  const sharedSnap = await getDoc(sharedConfigRef());
+  const marketPrices = parseSharedMarketPrices(sharedSnap.data());
+  const isUsAsset =
+    (existing.market ?? inferAssetMarketRegion(existing.name, existing.type || 'stock')) === 'US';
+
+  const sellResult = computeRealizedProfitOnSell(existing, quantity, sellPriceKrw, exchangeRate);
+  const {
+    sellAmount,
+    purchaseAmount,
+    realizedProfit,
+    profitRate,
+    cashInflow,
+    purchasePriceKrw,
+    purchaseUsd,
+    purchaseRate,
+    sellPriceUsd,
+  } = sellResult;
+
+  const cumulativeProfit = portfolio.cumulativeRealizedProfit ?? 0;
+  const nextCumulativeProfit = cumulativeProfit + realizedProfit;
+  const previousSavings = derivePortfolioCash(
+    currentAssets,
+    cumulativeProfit,
+    undefined,
+    exchangeRate
+  );
+
+  const sellRecord: PurchaseRecord = {
+    id: `${Date.now()}_sell_${sanitizeDocId(trimmedName)}`,
+    type: 'SELL',
+    quantity,
+    price: isUsAsset ? (sellPriceUsd ?? purchaseUsd ?? sellPriceKrw) : sellPriceKrw,
+    amount: isUsAsset ? (sellPriceUsd ?? purchaseUsd ?? sellPriceKrw) : sellPriceKrw,
+    exchangeRateAtTransaction: isUsAsset ? exchangeRate : undefined,
+    amountInKRW: cashInflow,
+    averagePriceAtSale: isUsAsset ? (purchaseUsd ?? 0) : purchasePriceKrw,
+    averageExchangeRateAtSale: isUsAsset ? purchaseRate : undefined,
+    realizedProfit,
+    realizedProfitRate: Math.round(profitRate * 100) / 100,
+    timestamp: new Date(),
+    date: new Date().toISOString().slice(0, 10),
+  };
+
+  const remainingQty = heldQty - quantity;
+  let nextAssets: AssetItem[];
+
+  if (remainingQty <= 0) {
+    nextAssets = currentAssets
+      .filter((_, index) => index !== assetIndex)
+      .map((asset) => stripUndefinedDeep(asset));
+  } else {
+    const remainingHistory = [...(existing.purchaseHistory ?? []), sellRecord];
+    const avgUsd = purchaseUsd ?? getPurchasePriceUsd(existing, exchangeRate);
+    const avgRate = purchaseRate ?? resolvePurchaseExchangeRate(existing, exchangeRate);
+    const totalPurchaseAmount = isUsAsset
+      ? Math.round(avgUsd * remainingQty * avgRate)
+      : Math.round(purchasePriceKrw * remainingQty);
+
+    nextAssets = currentAssets.map((asset, index) =>
+      index === assetIndex
+        ? stripUndefinedDeep({
+            ...asset,
+            quantity: remainingQty,
+            currentPrice: sellPriceKrw,
+            totalPurchaseAmount,
+            purchaseHistory: remainingHistory,
+            // purchasePriceUSD, purchaseExchangeRate, price — 절대 변경하지 않음
+          })
+        : stripUndefinedDeep(asset)
+    );
+  }
+
+  const nextAssetsWithPrices = nextAssets.map((asset) => {
+    const activeCurrentPrice =
+      marketPrices[asset.name.trim()] !== undefined
+        ? marketPrices[asset.name.trim()]
+        : (asset.currentPrice ?? asset.price);
+    return stripUndefinedDeep({
+      ...asset,
+      currentPrice: activeCurrentPrice,
+      sourceUrl: asset.sourceUrl || '',
+      searchReasoning: asset.searchReasoning || '',
+    });
+  });
+
+  const catalogPrices = buildCatalogPriceMap([], exchangeRate);
+  const newSavings = derivePortfolioCash(
+    nextAssets,
+    nextCumulativeProfit,
+    undefined,
+    exchangeRate
+  );
+  const initialCapital = resolveInitialCapital(portfolio);
+  const portfolioValues = updatePortfolioValues(
+    nextAssetsWithPrices,
+    newSavings,
+    initialCapital,
+    marketPrices,
+    exchangeRate,
+    catalogPrices
+  );
+
+  const transaction: Transaction = stripUndefinedDeep({
+    id: sellRecord.id,
+    assetName: trimmedName,
+    type: 'SELL',
+    quantity,
+    price: sellPriceKrw,
+    totalAmount: sellAmount,
+    amountInKRW: sellAmount,
+    exchangeRateAtPurchase: isUsAsset ? exchangeRate : undefined,
+    averagePriceAtSale: isUsAsset ? purchaseUsd : purchasePriceKrw,
+    averageExchangeRateAtSale: isUsAsset ? purchaseRate : undefined,
+    realizedProfit,
+    profitRate: Math.round(profitRate * 100) / 100,
+    transactionDate: sellRecord.date,
+    timestamp: new Date(),
+  });
+
+  const existingTransactions = (portfolio.transactions ?? []).map((item) =>
+    stripUndefinedDeep({
+      ...item,
+      timestamp:
+        item.timestamp instanceof Date
+          ? item.timestamp
+          : typeof item.timestamp?.toDate === 'function'
+            ? item.timestamp.toDate()
+            : item.timestamp,
+    })
+  );
+
+  try {
+    await setDoc(
+      docRef,
+      stripUndefinedDeep({
+        nickname: trimmedNickname,
+        assets: portfolioValues.assets,
+        savings: newSavings,
+        exchangeRate,
+        initialCapital,
+        totalCurrentValue: portfolioValues.totalCurrentValue,
+        profitAmount: portfolioValues.profitAmount,
+        profitRate: portfolioValues.profitRate,
+        totalAssets: portfolioValues.totalAssets,
+        totalProfitAmount: portfolioValues.totalProfitAmount,
+        totalProfitRate: portfolioValues.totalProfitRate,
+        totalPurchaseAmount: portfolioValues.totalPurchaseAmount,
+        unrealizedProfitAmount: portfolioValues.profitAmount,
+        hasRealPrices:
+          portfolio.hasRealPrices ??
+          portfolioValues.assets.some((a) => a.currentPrice !== a.price),
+        transactions: [...existingTransactions, transaction],
+        updatedAt: new Date(),
+        totalBudget: PORTFOLIO_STARTING_CAPITAL + nextCumulativeProfit,
+        cumulativeRealizedProfit: nextCumulativeProfit,
+        ...(portfolio.reason != null ? { reason: portfolio.reason } : {}),
+      }),
+      { merge: true }
+    );
+    console.info('[sellAsset] portfolio updated', {
+      nickname: trimmedNickname,
+      assetName: trimmedName,
+      quantity,
+      sellAmount,
+      realizedProfit,
+      previousSavings,
+      newSavings,
+    });
+  } catch (error) {
+    mapSellError(error, 'portfolio write failed');
+  }
+
+  return {
+    assetName: trimmedName,
+    quantity,
+    sellPriceKrw,
+    sellAmount,
+    cashInflow,
+    purchasePriceKrw,
+    purchaseAmount,
+    realizedProfit,
+    profitRate,
+    previousSavings,
+    newSavings,
+    newCumulativeRealizedProfit: nextCumulativeProfit,
+    assets: portfolioValues.assets,
+    message: `${trimmedName} ${quantity}주를 매도했습니다. 실현손익 ${realizedProfit >= 0 ? '+' : ''}${realizedProfit.toLocaleString()}원 (${profitRate.toFixed(2)}%), 입금액 ${cashInflow.toLocaleString()}원`,
+  };
+}
+
+export const GLOBAL_SETTINGS_DOC_ID = 'app';
+export const SHARED_CONFIG_DOC_ID = 'appSharedConfig';
+
+function globalSettingsRef() {
+  return doc(db, 'settings', GLOBAL_SETTINGS_DOC_ID);
+}
+
+function sharedConfigRef() {
+  return doc(db, 'portfolios', SHARED_CONFIG_DOC_ID);
+}
+
+function parseGlobalExchangeRate(data: Record<string, unknown> | undefined): number | null {
+  const rate = data?.exchangeRate;
+  return typeof rate === 'number' && rate > 0 ? rate : null;
+}
+
+function parseSharedMarketPrices(data: Record<string, unknown> | undefined): MarketPriceMap {
+  const raw = data?.marketPrices;
+  if (!raw || typeof raw !== 'object') return {};
+  const prices: MarketPriceMap = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      prices[key] = value;
+    }
+  }
+  return prices;
+}
+
+function mergeMarketPriceMaps(...maps: MarketPriceMap[]): MarketPriceMap {
+  return Object.assign({}, ...maps);
+}
+
+function mergeCustomAssetLists(
+  collectionAssets: CustomAsset[],
+  sharedAssets: CustomAsset[]
+): CustomAsset[] {
+  const byName = new Map<string, CustomAsset>();
+  for (const asset of sharedAssets) {
+    byName.set(asset.name.trim().toLowerCase(), asset);
+  }
+  for (const asset of collectionAssets) {
+    byName.set(asset.name.trim().toLowerCase(), asset);
+  }
+  return sortCustomAssetsByAddedAt(Array.from(byName.values()));
+}
+
+/** logicalName: multiCurrencySupport — 전역 환율 조회 (모든 참여자 공통) */
+export async function getGlobalExchangeRate(): Promise<number> {
+  const sharedSnap = await getDoc(sharedConfigRef());
+  const sharedRate = parseGlobalExchangeRate(sharedSnap.data());
+  if (sharedRate != null) return sharedRate;
+
+  const settingsSnap = await getDoc(globalSettingsRef());
+  const settingsRate = parseGlobalExchangeRate(settingsSnap.data());
+  if (settingsRate != null) return settingsRate;
+
+  return DEFAULT_EXCHANGE_RATE;
+}
+
+/** logicalName: multiCurrencySupport — 전역 환율 실시간 구독 */
+export function subscribeGlobalExchangeRate(
+  onUpdate: (rate: number) => void,
+  onError?: (error: Error) => void
+): () => void {
+  let sharedRate: number | null = null;
+  let settingsRate: number | null = null;
+
+  const emit = () => {
+    onUpdate(sharedRate ?? settingsRate ?? DEFAULT_EXCHANGE_RATE);
+  };
+
+  const unsubShared = onSnapshot(
+    sharedConfigRef(),
+    (snapshot) => {
+      sharedRate = parseGlobalExchangeRate(snapshot.data());
+      emit();
+    },
+    (error) => {
+      console.warn('[subscribeGlobalExchangeRate] shared config listener error:', error);
+      onError?.(error);
+    }
+  );
+
+  const unsubSettings = onSnapshot(
+    globalSettingsRef(),
+    (snapshot) => {
+      settingsRate = parseGlobalExchangeRate(snapshot.data());
+      emit();
+    },
+    (error) => {
+      console.warn('[subscribeGlobalExchangeRate] settings listener error:', error);
+    }
+  );
+
+  return () => {
+    unsubShared();
+    unsubSettings();
+  };
+}
+
+/** @deprecated 포트폴리오별 환율 대신 전역 환율 사용 */
+export async function getExchangeRate(_nickname?: string): Promise<number> {
+  return getGlobalExchangeRate();
+}
+
+export async function updateExchangeRate(
+  _nickname: string,
+  _newRate: number
+): Promise<Portfolio> {
+  throw new Error('환율은 관리자 모드에서만 수정할 수 있습니다.');
+}
+
+function getAdminPassword(): string {
+  return import.meta.env.VITE_ADMIN_PASSWORD?.trim() || '1234';
+}
+
+let adminSessionPassword: string | null = null;
+
+/** logicalName: newAdminModeAssetPriceEditor — 클라이언트 관리자 로그인 검증 */
+export function verifyAdminPassword(password: string): boolean {
+  return password.trim() === getAdminPassword();
+}
+
+/** 관리자 로그인 성공 후 API 호출용 비밀번호 저장 */
+export function setAdminSessionPassword(password: string): void {
+  adminSessionPassword = password.trim();
+}
+
+export function clearAdminSessionPassword(): void {
+  adminSessionPassword = null;
+}
+
+export function isAdminSessionActive(): boolean {
+  return adminSessionPassword != null && verifyAdminPassword(adminSessionPassword);
+}
+
+function resolveAdminPassword(override?: string): string {
+  const candidate = override?.trim() || adminSessionPassword?.trim();
+  if (candidate) return candidate;
+  return getAdminPassword();
+}
+
+export interface AdminAssetPriceDisplay {
+  marketLabel: string;
+  pricePrimary: string;
+  priceSecondary?: string;
+  priceKrw: number;
+  isUsAsset: boolean;
+}
+
+export function getAdminMarketLabel(asset: CustomAsset): string {
+  const region = asset.marketRegion ?? inferAssetMarketRegion(asset.name, asset.type);
+  if (region === 'Korea') return '국내 주식';
+  if (region === 'US') return '미국 주식';
+  return '암호화폐';
+}
+
+export function formatAdminUpdatedLabel(asset: CustomAsset): string {
+  const rawBy = asset.lastUpdatedBy ?? 'system';
+  const by =
+    rawBy === 'admin'
+      ? '관리자'
+      : rawBy === 'api'
+        ? 'API'
+        : rawBy;
+  const raw = asset.lastUpdatedAt ?? asset.lastPriceUpdatedAt;
+  let dateLabel = '-';
+  if (raw instanceof Date) {
+    dateLabel = raw.toISOString().slice(0, 10);
+  } else if (raw && typeof raw === 'object' && 'toDate' in raw && typeof raw.toDate === 'function') {
+    dateLabel = raw.toDate().toISOString().slice(0, 10);
+  } else if (typeof raw === 'string') {
+    dateLabel = raw.slice(0, 10);
+  }
+  return `${by} (${dateLabel})`;
+}
+
+export function resolveAdminAssetPriceDisplay(
+  asset: CustomAsset,
+  exchangeRate: number,
+  marketPrices?: MarketPriceMap
+): AdminAssetPriceDisplay {
+  const marketLabel = getAdminMarketLabel(asset);
+  const override = marketPrices?.[asset.name.trim()];
+  const region = asset.marketRegion ?? inferAssetMarketRegion(asset.name, asset.type);
+  const currency = asset.displayCurrency ?? getDefaultDisplayCurrency(region);
+  const isUsAsset = currency === 'USD' && (asset.priceUSD != null || region === 'US');
+
+  if (isUsAsset) {
+    const priceUsd =
+      asset.priceUSD != null && asset.priceUSD > 0
+        ? asset.priceUSD
+        : override != null && exchangeRate > 0
+          ? override / exchangeRate
+          : exchangeRate > 0
+            ? asset.price / exchangeRate
+            : 0;
+    const priceKrw =
+      override != null && override > 0
+        ? Math.round(override)
+        : Math.round(priceUsd * exchangeRate);
+    return {
+      marketLabel,
+      isUsAsset: true,
+      priceKrw,
+      pricePrimary: `${priceUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD`,
+      priceSecondary: `${priceKrw.toLocaleString('ko-KR')}원`,
+    };
+  }
+
+  const priceKrw =
+    override != null && override > 0
+      ? Math.round(override)
+      : Math.round(asset.priceKRW ?? asset.price);
+  return {
+    marketLabel,
+    isUsAsset: false,
+    priceKrw,
+    pricePrimary: `${priceKrw.toLocaleString('ko-KR')}원`,
+  };
+}
+
+/** logicalName: newAdminModeAssetPriceEditor — 자산명·티커 검색 */
+export function matchesAdminAssetSearch(asset: CustomAsset, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  return (
+    asset.name.toLowerCase().includes(q) ||
+    (asset.ticker ?? '').toLowerCase().includes(q)
+  );
+}
+
+/** Firestore Timestamp 등 비직렬화 필드 제거 — admin API 요청용 */
+function toAdminAssetPayload(asset: CustomAsset): CustomAsset {
+  return {
+    id: asset.id,
+    name: asset.name,
+    type: asset.type,
+    price: asset.price,
+    priceUSD: asset.priceUSD,
+    priceKRW: asset.priceKRW,
+    priceCrypto: asset.priceCrypto,
+    ticker: asset.ticker,
+    market: asset.market,
+    marketRegion: asset.marketRegion,
+    displayCurrency: asset.displayCurrency,
+    addedBy: asset.addedBy ?? 'admin',
+    addedAt: new Date(),
+  };
+}
+
+async function parseAdminApiResponse(response: Response): Promise<AdminPriceUpdateResult> {
+  const text = await response.text();
+  if (!text.trim()) {
+    if (response.status === 404) {
+      return {
+        success: false,
+        message:
+          '관리자 API를 찾을 수 없습니다. 터미널에서 npm run dev 로 서버를 재시작한 뒤 다시 시도해주세요.',
+      };
+    }
+    return {
+      success: false,
+      message: `서버 응답이 비어 있습니다 (HTTP ${response.status}).`,
+    };
+  }
+
+  try {
+    const data = JSON.parse(text) as AdminPriceUpdateResult;
+    if (!response.ok) {
+      return {
+        success: false,
+        message: data.message || '저장 중 오류가 발생했습니다.',
+      };
+    }
+    return data;
+  } catch {
+    return {
+      success: false,
+      message: '서버 응답을 처리하지 못했습니다.',
+    };
+  }
+}
+
+/** logicalName: multiCurrencySupport — 관리자 환율 조회 */
+export async function getAdminExchangeRate(): Promise<number> {
+  try {
+    const response = await fetch('/api/admin/exchange-rate');
+    if (!response.ok) return DEFAULT_EXCHANGE_RATE;
+    const text = await response.text();
+    if (!text.trim()) return DEFAULT_EXCHANGE_RATE;
+    const data = JSON.parse(text) as { rate?: number };
+    return typeof data.rate === 'number' && data.rate > 0 ? data.rate : DEFAULT_EXCHANGE_RATE;
+  } catch {
+    return DEFAULT_EXCHANGE_RATE;
+  }
+}
+
+/** logicalName: multiCurrencySupport — 관리자 환율 수정 (전체 포트폴리오) */
+export async function updateAdminExchangeRate(
+  nickname: string,
+  newRate: number,
+  reason?: AdminExchangeRateUpdateReason
+): Promise<AdminPriceUpdateResult> {
+  if (!Number.isFinite(newRate) || newRate <= 0) {
+    return { success: false, message: '유효한 환율을 입력해주세요.' };
+  }
+
+  try {
+    const response = await fetch('/api/admin/update-exchange-rate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        password: resolveAdminPassword(),
+        nickname,
+        newRate,
+        reason,
+      }),
+    });
+
+    return parseAdminApiResponse(response);
+  } catch (error) {
+    console.error('[updateAdminExchangeRate] failed:', error);
+    return {
+      success: false,
+      message: error instanceof Error ? error.message : '환율 저장 중 오류가 발생했습니다.',
+    };
+  }
+}
+
+/** logicalName: adminAddAsset — 관리자 상품 추가 (전체 참여자 공유) */
+export async function addAdminCustomAsset(input: {
+  assetName: string;
+  type: CustomAsset['type'];
+  inputPrice: number | string;
+  displayCurrency: DisplayCurrency;
+  ticker?: string;
+  sector?: string;
+  market?: string;
+  sourceUrl?: string;
+  marketRegion?: AssetMarket;
+}): Promise<AdminPriceUpdateResult & { asset?: CustomAsset }> {
+  try {
+    const response = await fetch('/api/admin/add-asset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        password: resolveAdminPassword(),
+        ...input,
+      }),
+    });
+
+    const text = await response.text();
+    if (!text.trim()) {
+      return {
+        success: false,
+        message: response.status === 404
+          ? '관리자 API를 찾을 수 없습니다. npm run dev 로 서버를 재시작해주세요.'
+          : `서버 응답이 비어 있습니다 (HTTP ${response.status}).`,
+      };
+    }
+
+    const data = JSON.parse(text) as AdminPriceUpdateResult & { asset?: CustomAsset };
+    if (!response.ok) {
+      return {
+        success: false,
+        message: data.message || '상품 추가 중 오류가 발생했습니다.',
+      };
+    }
+    return data;
+  } catch (error) {
+    console.error('[addAdminCustomAsset] failed:', error);
+    return {
+      success: false,
+      message: error instanceof Error ? error.message : '상품 추가 중 오류가 발생했습니다.',
+    };
+  }
+}
+
+/** logicalName: realtimePriceApiPhase6 — 서버 실시간 시세 스냅샷 조회 */
+export async function fetchRealtimePriceSnapshot(): Promise<RealtimePriceSnapshot> {
+  const response = await fetch('/api/realtime-prices');
+  if (!response.ok) {
+    throw new Error('실시간 가격 조회에 실패했습니다.');
+  }
+  const data = (await response.json()) as RealtimePriceSnapshot & { success?: boolean };
+  return {
+    usdKrw: data.usdKrw ?? DEFAULT_EXCHANGE_RATE,
+    updatedAt: data.updatedAt ?? null,
+    prices: data.prices ?? {},
+  };
+}
+
+/** logicalName: realtimePriceApiPhase6 — 특정 자산 실시간 시세 조회 */
+export async function queryRealtimePrices(
+  names: string[],
+  options?: { forceRefresh?: boolean }
+): Promise<RealtimePriceQuote[]> {
+  const response = await fetch('/api/realtime-prices/query', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      names,
+      forceRefresh: options?.forceRefresh ?? false,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error('실시간 가격 조회에 실패했습니다.');
+  }
+
+  const data = (await response.json()) as { quotes?: RealtimePriceQuote[] };
+  return data.quotes ?? [];
+}
+
+/** logicalName: realtimePriceApiPhase6 — 서버 캐시 수동 갱신 트리거 */
+export async function refreshRealtimePrices(): Promise<RealtimePriceSnapshot> {
+  const response = await fetch('/api/realtime-prices/refresh', { method: 'POST' });
+  if (!response.ok) {
+    throw new Error('실시간 가격 갱신에 실패했습니다.');
+  }
+  const data = (await response.json()) as RealtimePriceSnapshot;
+  return {
+    usdKrw: data.usdKrw ?? DEFAULT_EXCHANGE_RATE,
+    updatedAt: data.updatedAt ?? null,
+    prices: data.prices ?? {},
+  };
+}
+
+/** logicalName: adminModeEnhancedPriceUpdate — 관리자 시세 수정 (assetId + reason) */
+export async function updateAdminAssetPriceById(
+  assetId: string,
+  newPrice: number,
+  reason: AdminPriceUpdateReason,
+  asset?: CustomAsset
+): Promise<AdminPriceUpdateResult> {
+  const trimmedId = assetId.trim();
+  if (!trimmedId) {
+    return { success: false, message: '자산 ID가 필요합니다.' };
+  }
+
+  if (asset) {
+    return updateAdminAssetPrice(asset, newPrice, reason);
+  }
+
+  return {
+    success: false,
+    message: '자산 정보가 필요합니다.',
+  };
+}
+
+/** logicalName: adminModeEnhancedPriceUpdate — 관리자 시세 수정 (서버 API 경유) */
+export async function updateAdminAssetPrice(
+  asset: CustomAsset,
+  newPrice: number,
+  reason: AdminPriceUpdateReason
+): Promise<AdminPriceUpdateResult> {
+  const assetId = asset.id?.trim();
+  if (!assetId) {
+    return { success: false, message: '자산 ID가 필요합니다.' };
+  }
+  if (!Number.isFinite(newPrice) || newPrice <= 0) {
+    return { success: false, message: '유효한 가격을 입력해주세요.' };
+  }
+
+  try {
+    const response = await fetch('/api/admin/update-asset-price', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        password: resolveAdminPassword(),
+        asset: toAdminAssetPayload(asset),
+        newPrice,
+        reason,
+      }),
+    });
+
+    return parseAdminApiResponse(response);
+  } catch (error) {
+    console.error('[updateAdminAssetPrice] failed:', error);
+    return {
+      success: false,
+      message: error instanceof Error ? error.message : '저장 중 오류가 발생했습니다.',
+    };
+  }
+}
+
+/** logicalName: deleteExistingAdminMode — Firestore marketPrices(customPrices) 구독 */
+export function subscribeMarketPrices(
+  onUpdate: (prices: MarketPriceMap) => void,
+  onError?: (error: Error) => void
+): () => void {
+  let collectionPrices: MarketPriceMap = {};
+  let sharedPrices: MarketPriceMap = {};
+
+  const emit = () => {
+    onUpdate(mergeMarketPriceMaps(collectionPrices, sharedPrices));
+  };
+
+  const unsubCollection = onSnapshot(
+    query(collection(db, 'customPrices')),
+    (snapshot) => {
+      collectionPrices = {};
+      snapshot.forEach((snapDoc) => {
+        const data = snapDoc.data();
+        const isAdminPrice =
+          data.lastUpdatedBy === 'admin' || data.source === 'admin_override';
+        if (!isAdminPrice) return;
+
+        const value = data.price;
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          collectionPrices[snapDoc.id] = value;
+        }
+      });
+      emit();
+    },
+    (error) => {
+      console.warn('[subscribeMarketPrices] collection listener error:', error);
+      onError?.(error);
+    }
+  );
+
+  const unsubShared = onSnapshot(
+    sharedConfigRef(),
+    (snapshot) => {
+      sharedPrices = parseSharedMarketPrices(snapshot.data());
+      emit();
+    },
+    (error) => {
+      console.warn('[subscribeMarketPrices] shared config listener error:', error);
+    }
+  );
+
+  return () => {
+    unsubCollection();
+    unsubShared();
+  };
+}
+
+/** logicalName: deleteExistingAdminMode — 시세 수동 조정 저장 */
+export async function upsertMarketPrice(assetName: string, priceKrw: number): Promise<void> {
+  await setDoc(
+    doc(db, 'customPrices', assetName.trim()),
+    { price: priceKrw, updatedAt: new Date(), source: 'admin_override' },
+    { merge: true }
+  );
+}
+
+/** logicalName: deleteExistingAdminMode — 시세 조정 초기화 */
+export async function deleteMarketPrice(assetName: string): Promise<void> {
+  await deleteDoc(doc(db, 'customPrices', assetName.trim()));
+}
+
+/** @deprecated 실시간 API → Firestore 반영 비활성화 (관리자 수동 시세만 허용) */
+export async function syncRealtimeQuotesToCustomPrices(
+  _quotes: RealtimePriceQuote[]
+): Promise<void> {
+  console.warn(
+    '[syncRealtimeQuotesToCustomPrices] skipped — 시세는 관리자 모드에서만 변경됩니다.'
+  );
+}
