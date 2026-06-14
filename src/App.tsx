@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback, type ReactNode } from 'react';
 import {
   collection,
   doc,
@@ -8,8 +8,8 @@ import {
   getDoc,
   getDocFromServer
 } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType, getAllCommunityCustomAssets, fetchRealtimePriceSnapshot, sellAsset, persistPortfolio, subscribeMarketPrices, subscribeGlobalExchangeRate, subscribeCommunityCustomAssets, SHARED_CONFIG_DOC_ID, createPortfolio, updatePortfolioValues, resolveInitialCapital, repairPortfolioIfNeeded, setAdminSessionPassword, clearAdminSessionPassword } from './firebase';
-import { AssetItem, CustomAsset, Portfolio, MarketPriceMap } from './types';
+import { db, handleFirestoreError, OperationType, getAllCommunityCustomAssets, fetchRealtimePriceSnapshot, sellAsset, persistPortfolio, subscribeMarketPrices, subscribeGlobalExchangeRate, subscribeCommunityCustomAssets, SHARED_CONFIG_DOC_ID, createPortfolio, updatePortfolioValues, resolveInitialCapital, repairPortfolioIfNeeded, setAdminSessionPassword, clearAdminSessionPassword, getAllTransactions, filterTransactions, calculateTransactionStats, formatTransactionAssetLabel, formatTransactionDateTime, formatTransactionPriceQuantity, exportTransactionsToCsv } from './firebase';
+import { AssetItem, CustomAsset, Portfolio, MarketPriceMap, PortfolioMainTab, TransactionFilterType, TransactionPeriodFilter, TransactionFilterState, Transaction } from './types';
 import { LoginModal } from './components/LoginModal';
 import { AssetInputForm } from './components/AssetInputForm';
 import { PortfolioChart } from './components/PortfolioChart';
@@ -20,6 +20,7 @@ import { CustomAssetModal } from './components/CustomAssetModal';
 import { RecommendedAssetsSection } from './components/RecommendedAssetsSection';
 import { BudgetSummaryCard } from './components/BudgetSummaryCard';
 import { SellAssetModal } from './components/SellAssetModal';
+import { TransactionDetailModal } from './components/TransactionDetailModal';
 import { formatCommas, formatKRW, inferAssetMarket, inferAssetSector, enrichAssetCurrencyFields, DEFAULT_EXCHANGE_RATE } from './utils';
 import { computeSellPreview, getProfitStyle, computePortfolioProfitSummary, derivePortfolioCash, PORTFOLIO_STARTING_CAPITAL, isUsMarketAsset, buildCatalogPriceMap, getTotalPurchaseAmountKrw, computeBrokeragePortfolioMetrics } from './utils/portfolioPnL';
 import { getPresetByName } from './presets';
@@ -35,10 +36,25 @@ import {
   TrendingUp,
   ArrowRightLeft,
   ArrowUpDown,
-  Plus
+  Plus,
+  History,
+  Settings,
+  LayoutDashboard,
+  Search,
+  Download,
+  TrendingDown
 } from 'lucide-react';
 
 const TOTAL_BUDGET = 10000000; // 10 Million KRW
+
+const DEFAULT_TRANSACTION_FILTER: TransactionFilterState = {
+  type: 'ALL',
+  assetName: 'ALL',
+  searchQuery: '',
+  period: 'ALL',
+  page: 1,
+  pageSize: 20,
+};
 
 export default function App() {
   const [nickname, setNickname] = useState<string | null>(null);
@@ -86,6 +102,10 @@ export default function App() {
   const [exchangeRate, setExchangeRate] = useState(DEFAULT_EXCHANGE_RATE);
   const [sellModalIndex, setSellModalIndex] = useState<number | null>(null);
   const [isSellSubmitting, setIsSellSubmitting] = useState(false);
+  const [activeMainTab, setActiveMainTab] = useState<PortfolioMainTab>('portfolio');
+  const [transactionFilter, setTransactionFilter] = useState<TransactionFilterState>(DEFAULT_TRANSACTION_FILTER);
+  const [transactionSearchInput, setTransactionSearchInput] = useState('');
+  const [selectedTransaction, setSelectedTransaction] = useState<Transaction | null>(null);
   const portfolioHydratedFor = useRef<string | null>(null);
   const repairAttemptedFor = useRef<string | null>(null);
 
@@ -398,6 +418,71 @@ export default function App() {
 
   const existingPortfolio = allPortfolios.find((p) => p.nickname === nickname);
   const isReasonSynced = reason.trim() === (existingPortfolio?.reason || '').trim();
+
+  const portfolioTransactions = useMemo(() => {
+    if (!existingPortfolio) return [] as Transaction[];
+    return getAllTransactions(existingPortfolio);
+  }, [existingPortfolio]);
+
+  const patchTransactionFilter = useCallback((patch: Partial<TransactionFilterState>, resetPage = true) => {
+    setTransactionFilter((prev) => ({
+      ...prev,
+      ...patch,
+      page: resetPage ? 1 : patch.page ?? prev.page,
+    }));
+  }, []);
+
+  const transactionAssetOptions = useMemo(() => {
+    const names = new Set<string>();
+    for (const tx of portfolioTransactions) {
+      const name = tx.assetName?.trim();
+      if (name) names.add(name);
+    }
+    return Array.from(names).sort((a, b) => a.localeCompare(b, 'ko'));
+  }, [portfolioTransactions]);
+
+  const resolveTransactionTicker = useCallback(
+    (assetName: string, tx?: Transaction): string | undefined => {
+      if (tx?.ticker?.trim()) return tx.ticker.trim();
+      const preset = getPresetByName(assetName);
+      if (preset?.ticker) return preset.ticker;
+      const custom = communityCustomAssets.find((a) => a.name.trim() === assetName.trim());
+      return custom?.ticker?.trim();
+    },
+    [communityCustomAssets]
+  );
+
+  const filteredTransactions = useMemo(() => {
+    const type =
+      transactionFilter.type !== 'ALL' ? (transactionFilter.type as 'BUY' | 'SELL') : undefined;
+    return filterTransactions(portfolioTransactions, {
+      type,
+      assetName: transactionFilter.assetName,
+      period: transactionFilter.period,
+      searchQuery: transactionFilter.searchQuery,
+    });
+  }, [portfolioTransactions, transactionFilter]);
+
+  const filteredTransactionStats = useMemo(
+    () => calculateTransactionStats(filteredTransactions),
+    [filteredTransactions]
+  );
+
+  const transactionTotalPages = Math.max(
+    1,
+    Math.ceil(filteredTransactions.length / transactionFilter.pageSize)
+  );
+
+  const paginatedTransactions = useMemo(() => {
+    const start = (transactionFilter.page - 1) * transactionFilter.pageSize;
+    return filteredTransactions.slice(start, start + transactionFilter.pageSize);
+  }, [filteredTransactions, transactionFilter.page, transactionFilter.pageSize]);
+
+  useEffect(() => {
+    if (transactionFilter.page > transactionTotalPages) {
+      patchTransactionFilter({ page: transactionTotalPages }, false);
+    }
+  }, [transactionFilter.page, transactionTotalPages, patchTransactionFilter]);
 
   const persistCurrentPortfolio = useCallback(
     async (nextAssets: AssetItem[], nextCumulativeProfit = cumulativeRealizedProfit) => {
@@ -840,6 +925,376 @@ export default function App() {
     setSellQuantity((prev) => Math.min(maxQty, Math.max(1, prev + delta)));
   };
 
+  const handleTransactionSearch = () => {
+    patchTransactionFilter({ searchQuery: transactionSearchInput.trim() });
+  };
+
+  const handleDownloadTransactionsCsv = () => {
+    const csv = exportTransactionsToCsv(filteredTransactions);
+    const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `거래이력_${nickname || 'portfolio'}_${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const profitColorClass = (value: number) =>
+    value > 0 ? 'text-rose-655' : value < 0 ? 'text-blue-655' : 'text-slate-600';
+
+  const mainTabItems: { id: PortfolioMainTab; label: string; icon: ReactNode }[] = [
+    { id: 'portfolio', label: '포트폴리오', icon: <LayoutDashboard className="w-3.5 h-3.5" /> },
+    { id: 'transactions', label: '거래이력', icon: <History className="w-3.5 h-3.5" /> },
+    { id: 'settings', label: '설정', icon: <Settings className="w-3.5 h-3.5" /> },
+  ];
+
+  const renderPortfolioSubNav = () => (
+    <div className="bg-white border-b border-slate-200" data-logical-name="phase8TransactionHistory">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+        <h2 className="text-base sm:text-lg font-black text-slate-800 tracking-tight uppercase font-mono">
+          INVEST10M <span className="text-slate-400 font-bold">—</span> {nickname}
+        </h2>
+        <nav className="flex flex-wrap gap-2 mt-4" aria-label="포트폴리오 메인 탭">
+          {mainTabItems.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setActiveMainTab(tab.id)}
+              className={`px-4 py-2 rounded-xl text-xs font-black flex items-center gap-1.5 transition cursor-pointer border ${
+                activeMainTab === tab.id
+                  ? 'bg-slate-900 text-white border-slate-900 shadow-sm'
+                  : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
+              }`}
+            >
+              {tab.icon}
+              {tab.label}
+            </button>
+          ))}
+        </nav>
+      </div>
+    </div>
+  );
+
+  const renderTransactionsPanel = () => {
+    const stats = filteredTransactionStats;
+    const profitIcon =
+      stats.totalRealizedProfitKrw > 0 ? '▲' : stats.totalRealizedProfitKrw < 0 ? '▼' : '';
+
+    return (
+      <div
+        className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden"
+        data-logical-name="transactionHistoryPhase8"
+      >
+        <div className="px-5 sm:px-6 py-5 border-b border-slate-200 bg-slate-50/60 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <h2 className="text-lg font-black text-slate-800 flex items-center gap-2">
+            <History className="w-5 h-5 text-indigo-500" />
+            거래 이력
+          </h2>
+          <button
+            type="button"
+            onClick={handleDownloadTransactionsCsv}
+            disabled={filteredTransactions.length === 0}
+            className="px-3 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-black rounded-xl transition cursor-pointer flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+          >
+            <Download className="w-3.5 h-3.5" />
+            CSV 다운로드
+          </button>
+        </div>
+
+        <div className="p-5 sm:p-6 space-y-6">
+          {/* 필터 */}
+          <section>
+            <p className="text-[11px] font-extrabold text-slate-500 uppercase tracking-wider mb-3">필터</p>
+            <div className="space-y-4">
+              <div className="flex flex-wrap gap-2">
+                {(['ALL', 'BUY', 'SELL'] as TransactionFilterType[]).map((filter) => (
+                  <button
+                    key={filter}
+                    type="button"
+                    onClick={() => patchTransactionFilter({ type: filter })}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-black border transition cursor-pointer ${
+                      transactionFilter.type === filter
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                    }`}
+                  >
+                    {filter === 'ALL' ? '전체' : filter === 'BUY' ? '매수만' : '매도만'}
+                  </button>
+                ))}
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                <label className="block">
+                  <span className="text-[11px] font-bold text-slate-500 mb-1 block">자산</span>
+                  <select
+                    value={transactionFilter.assetName}
+                    onChange={(e) => patchTransactionFilter({ assetName: e.target.value })}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl py-2 px-3 text-sm font-bold text-slate-800 outline-none focus:border-indigo-400 cursor-pointer"
+                  >
+                    <option value="ALL">전체</option>
+                    {transactionAssetOptions.map((name) => (
+                      <option key={name} value={name}>
+                        {name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="block">
+                  <span className="text-[11px] font-bold text-slate-500 mb-1 block">기간</span>
+                  <select
+                    value={transactionFilter.period}
+                    onChange={(e) =>
+                      patchTransactionFilter({ period: e.target.value as TransactionPeriodFilter })
+                    }
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl py-2 px-3 text-sm font-bold text-slate-800 outline-none focus:border-indigo-400 cursor-pointer"
+                  >
+                    <option value="ALL">전체</option>
+                    <option value="1M">최근 1개월</option>
+                    <option value="3M">최근 3개월</option>
+                    <option value="1Y">최근 1년</option>
+                  </select>
+                </label>
+
+                <label className="block sm:col-span-2">
+                  <span className="text-[11px] font-bold text-slate-500 mb-1 block">자산명 검색</span>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={transactionSearchInput}
+                      onChange={(e) => setTransactionSearchInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleTransactionSearch();
+                      }}
+                      placeholder="예: 삼성, SK하이닉스, 마이크론"
+                      className="flex-1 bg-slate-50 border border-slate-200 rounded-xl py-2 px-3 text-sm text-slate-800 outline-none focus:border-indigo-400"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleTransactionSearch}
+                      className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-black rounded-xl transition cursor-pointer flex items-center gap-1.5 shrink-0"
+                    >
+                      <Search className="w-3.5 h-3.5" />
+                      검색
+                    </button>
+                  </div>
+                </label>
+              </div>
+            </div>
+          </section>
+
+          {/* 통계 */}
+          <section className="bg-slate-50 border border-slate-200 rounded-xl p-4 sm:p-5">
+            <p className="text-[11px] font-extrabold text-slate-500 uppercase tracking-wider mb-3">통계</p>
+            <div className="font-mono text-sm text-slate-800 space-y-1 leading-relaxed">
+              <p>
+                <span className="font-bold">총 거래:</span> {stats.totalCount}건
+              </p>
+              <p className="pl-3 text-slate-600">
+                ├─ <span className="font-bold">매수:</span> {stats.buyCount}건
+              </p>
+              <p className="pl-3 text-slate-600">
+                ├─ <span className="font-bold">매도:</span> {stats.sellCount}건
+              </p>
+              <p className={`pl-3 ${profitColorClass(stats.totalRealizedProfitKrw)}`}>
+                └─ <span className="font-bold">총 손익:</span>{' '}
+                {stats.totalRealizedProfitKrw >= 0 ? '+' : ''}
+                {formatCommas(stats.totalRealizedProfitKrw)}원 {profitIcon}
+                <span className="text-slate-400 text-xs font-sans ml-1">(매도 기준)</span>
+              </p>
+              <p className={`pl-3 ${profitColorClass(stats.averageProfitRate)}`}>
+                └─ <span className="font-bold">평균 수익률:</span>{' '}
+                {stats.averageProfitRate >= 0 ? '+' : ''}
+                {stats.averageProfitRate.toFixed(1)}%
+                <span className="text-slate-400 text-xs font-sans ml-1">(매도 기준)</span>
+              </p>
+              {stats.monthlyBreakdown.length > 0 && (
+                <>
+                  <p className="pt-2 font-bold text-slate-700">월별 통계:</p>
+                  {stats.monthlyBreakdown.map((month, index) => {
+                    const isLast = index === stats.monthlyBreakdown.length - 1;
+                    const branch = isLast ? '└─' : '├─';
+                    return (
+                      <p key={month.monthKey} className="pl-3 text-slate-600">
+                        {branch} {month.label}: {month.count}건
+                      </p>
+                    );
+                  })}
+                </>
+              )}
+            </div>
+          </section>
+
+          {/* 거래 목록 */}
+          <section>
+            <p className="text-[11px] font-extrabold text-slate-500 uppercase tracking-wider mb-3">거래 목록</p>
+            <div className="border-t border-slate-200">
+              {paginatedTransactions.length === 0 ? (
+                <div className="text-center py-14 text-slate-400">
+                  <History className="w-8 h-8 mx-auto mb-3 text-slate-300" />
+                  <p className="text-sm font-bold text-slate-500">조건에 맞는 거래가 없습니다</p>
+                </div>
+              ) : (
+                paginatedTransactions.map((tx, index) => {
+                  const isBuy = tx.type === 'BUY';
+                  const ticker = resolveTransactionTicker(tx.assetName, tx);
+                  const assetLabel = formatTransactionAssetLabel(tx, ticker);
+                  const amountKrw = Math.round(tx.amountInKRW ?? tx.totalAmount ?? 0);
+
+                  return (
+                    <button
+                      key={tx.id}
+                      type="button"
+                      onClick={() => setSelectedTransaction(tx)}
+                      className={`w-full text-left py-4 px-2 -mx-2 rounded-xl hover:bg-slate-50 transition cursor-pointer ${
+                        index < paginatedTransactions.length - 1 ? 'border-b border-slate-100' : ''
+                      }`}
+                    >
+                      <div className="flex items-start gap-3">
+                        <div
+                          className={`shrink-0 w-9 h-9 rounded-xl flex items-center justify-center border ${
+                            isBuy
+                              ? 'bg-emerald-50 border-emerald-200 text-emerald-600'
+                              : 'bg-rose-50 border-rose-200 text-rose-600'
+                          }`}
+                        >
+                          {isBuy ? (
+                            <TrendingUp className="w-4 h-4" />
+                          ) : (
+                            <TrendingDown className="w-4 h-4" />
+                          )}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                            <span className="text-xs font-mono font-bold text-slate-500">
+                              {formatTransactionDateTime(tx)}
+                            </span>
+                            <span
+                              className={`text-[10px] font-black px-1.5 py-0.5 rounded ${
+                                isBuy ? 'text-emerald-700 bg-emerald-50' : 'text-rose-700 bg-rose-50'
+                              }`}
+                            >
+                              {isBuy ? 'BUY' : 'SELL'}
+                            </span>
+                          </div>
+                          <p className="text-sm font-extrabold text-slate-800 mt-1 truncate">{assetLabel}</p>
+                          <p className="text-xs font-mono text-slate-500 mt-0.5">
+                            {formatTransactionPriceQuantity(tx)}
+                            <span className="text-slate-300 mx-1.5">·</span>
+                            총 {formatCommas(amountKrw)}원
+                          </p>
+                          {!isBuy && tx.realizedProfit != null && (
+                            <p className={`text-xs font-bold font-mono mt-1 ${profitColorClass(tx.realizedProfit)}`}>
+                              손익 {tx.realizedProfit >= 0 ? '+' : ''}
+                              {formatCommas(tx.realizedProfit)}원
+                              {tx.profitRate != null
+                                ? ` (${tx.profitRate >= 0 ? '+' : ''}${tx.profitRate.toFixed(2)}%)`
+                                : ''}{' '}
+                              {tx.realizedProfit > 0 ? '▲' : tx.realizedProfit < 0 ? '▼' : ''}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                      <p className="text-[10px] text-indigo-500 font-bold mt-2 pl-12">탭하여 상세 보기</p>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+
+            {filteredTransactions.length > transactionFilter.pageSize && (
+              <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-5 border-t border-slate-100 mt-2">
+                <p className="text-xs font-bold text-slate-500">
+                  페이지 {transactionFilter.page}/{transactionTotalPages}
+                  <span className="text-slate-400 font-normal ml-2">
+                    (총 {filteredTransactions.length}건 · {transactionFilter.pageSize}건/페이지)
+                  </span>
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => patchTransactionFilter({ page: transactionFilter.page - 1 }, false)}
+                    disabled={transactionFilter.page <= 1}
+                    className="px-3 py-1.5 rounded-lg text-xs font-black border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40 cursor-pointer disabled:cursor-not-allowed"
+                  >
+                    이전
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => patchTransactionFilter({ page: transactionFilter.page + 1 }, false)}
+                    disabled={transactionFilter.page >= transactionTotalPages}
+                    className="px-4 py-1.5 rounded-lg text-xs font-black border border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 disabled:opacity-40 cursor-pointer disabled:cursor-not-allowed"
+                  >
+                    더보기
+                  </button>
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      </div>
+    );
+  };
+
+  const renderSettingsPanel = () => (
+    <div className="max-w-2xl space-y-6">
+      <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
+        <h3 className="text-base font-extrabold text-slate-800 flex items-center gap-2 pb-4 border-b border-slate-100">
+          <Settings className="w-4 h-4 text-slate-500" />
+          계정 정보
+        </h3>
+        <dl className="mt-4 space-y-3 text-sm">
+          <SettingsRow label="닉네임" value={nickname} />
+          <SettingsRow label="초기 자본" value={`₩${formatCommas(initialCapital)}원`} />
+          <SettingsRow label="현재 현금" value={`₩${formatCommas(savings)}원`} />
+          <SettingsRow label="가용 투자 한도" value={`₩${formatCommas(activeTotalBudget)}원`} />
+          <SettingsRow
+            label="누적 실현손익"
+            value={`${realizedProfitTotal >= 0 ? '+' : ''}${formatCommas(realizedProfitTotal)}원`}
+            valueClass={
+              realizedProfitTotal > 0
+                ? 'text-rose-655'
+                : realizedProfitTotal < 0
+                  ? 'text-blue-655'
+                  : undefined
+            }
+          />
+          <SettingsRow label="적용 환율" value={`1 USD = ${formatCommas(effectiveExchangeRate)}원`} />
+        </dl>
+      </div>
+
+      <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
+        <h3 className="text-base font-extrabold text-slate-800 pb-4 border-b border-slate-100">
+          투자 전략 / 구성 사유
+        </h3>
+        {reason.trim() ? (
+          <p className="mt-4 text-sm text-slate-600 leading-relaxed whitespace-pre-wrap">{reason}</p>
+        ) : (
+          <p className="mt-4 text-sm text-slate-400 italic">저장된 전략 설명이 없습니다. 포트폴리오 탭에서 작성할 수 있습니다.</p>
+        )}
+        <button
+          type="button"
+          onClick={() => setActiveMainTab('portfolio')}
+          className="mt-4 text-xs font-bold text-indigo-600 hover:text-indigo-800 cursor-pointer"
+        >
+          포트폴리오 탭에서 수정하기 →
+        </button>
+      </div>
+
+      <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
+        <button
+          type="button"
+          onClick={handleLogout}
+          className="w-full py-3 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-sm font-black rounded-xl transition cursor-pointer flex items-center justify-center gap-2"
+        >
+          <LogOut className="w-4 h-4" />
+          로그아웃
+        </button>
+      </div>
+    </div>
+  );
+
   const renderNavbar = () => (
     <header className="flex items-center justify-between px-6 sm:px-8 py-4 bg-white border-b border-slate-200 shrink-0 sticky top-0 z-40 shadow-sm/5 bg-white/95 backdrop-blur-sm">
       <div className="flex items-center gap-3">
@@ -963,8 +1418,11 @@ export default function App() {
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col justify-between font-sans">
       <div>
         {renderNavbar()}
+        {renderPortfolioSubNav()}
 
         <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+          {activeMainTab === 'portfolio' && (
+          <>
           {/* Main workspace split columns */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
             
@@ -1510,6 +1968,13 @@ export default function App() {
             )}
           </div>
 
+          </>
+          )}
+
+          {activeMainTab === 'transactions' && renderTransactionsPanel()}
+
+          {activeMainTab === 'settings' && renderSettingsPanel()}
+
         </main>
       </div>
 
@@ -1540,6 +2005,14 @@ export default function App() {
             setTimeout(() => setSuccessMsg(''), 4500);
             setShowCustomAssetModal(false);
           }}
+        />
+      )}
+
+      {selectedTransaction && (
+        <TransactionDetailModal
+          transaction={selectedTransaction}
+          ticker={resolveTransactionTicker(selectedTransaction.assetName, selectedTransaction)}
+          onClose={() => setSelectedTransaction(null)}
         />
       )}
 
@@ -1574,6 +2047,23 @@ function InfoRow({
       <span className={`text-right ${bold ? 'font-black text-slate-900' : 'font-bold text-slate-800'}`}>
         {value}
       </span>
+    </div>
+  );
+}
+
+function SettingsRow({
+  label,
+  value,
+  valueClass,
+}: {
+  label: string;
+  value: string;
+  valueClass?: string;
+}) {
+  return (
+    <div className="flex justify-between items-center gap-4 py-1 border-b border-slate-50 last:border-0">
+      <dt className="text-slate-500 shrink-0">{label}</dt>
+      <dd className={`font-bold font-mono text-right ${valueClass ?? 'text-slate-800'}`}>{value}</dd>
     </div>
   );
 }

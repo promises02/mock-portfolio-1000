@@ -13,8 +13,8 @@ import {
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 import { ALL_PRESETS, getPresetByName } from './presets';
-import { AssetType, AssetMarket, CustomAsset, DisplayCurrency, Portfolio, ValidationResult, BuyRequest, AssetItem, Transaction, BuyAssetError, SellAssetError, SellAssetRequest, SellAssetResult, RealtimePriceQuote, RealtimePriceSnapshot, MarketPriceMap, AdminPriceUpdateReason, AdminExchangeRateUpdateReason, AdminPriceUpdateResult, PurchaseRecord } from './types';
-import { DEFAULT_EXCHANGE_RATE, computeKrwEquivalent, getDefaultDisplayCurrency, inferAssetMarketRegion, enrichAssetCurrencyFields, inferAssetMarket, inferAssetSector } from './utils';
+import { AssetType, AssetMarket, CustomAsset, DisplayCurrency, Portfolio, ValidationResult, BuyRequest, AssetItem, Transaction, TransactionStats, TransactionPeriodFilter, TransactionListFilters, TransactionMonthlyStat, TransactionDetailRow, BuyAssetError, SellAssetError, SellAssetRequest, SellAssetResult, RealtimePriceQuote, RealtimePriceSnapshot, MarketPriceMap, AdminPriceUpdateReason, AdminExchangeRateUpdateReason, AdminPriceUpdateResult, PurchaseRecord } from './types';
+import { DEFAULT_EXCHANGE_RATE, computeKrwEquivalent, getDefaultDisplayCurrency, inferAssetMarketRegion, enrichAssetCurrencyFields, inferAssetMarket, inferAssetSector, formatCommas } from './utils';
 import {
   derivePortfolioCash,
   getPurchaseUnitKrw,
@@ -986,6 +986,7 @@ export async function buyAsset(nickname: string, request: BuyRequest): Promise<v
   );
   const hasRealPrices = portfolioValues.assets.some((a) => a.currentPrice !== a.price);
 
+  const presetTicker = getPresetByName(trimmedName)?.ticker;
   const transaction: Transaction = stripUndefinedDeep({
     id: buyRecord.id,
     assetName: trimmedName,
@@ -993,8 +994,10 @@ export async function buyAsset(nickname: string, request: BuyRequest): Promise<v
     quantity,
     price: isUsBuy ? Math.round(priceUsd * 100) / 100 : priceKrw,
     totalAmount: amountInKrw,
+    ...(ticker?.trim() ? { ticker: ticker.trim() } : presetTicker ? { ticker: presetTicker } : {}),
     ...(isUsBuy
       ? {
+          priceUsd: Math.round(priceUsd * 100) / 100,
           exchangeRateAtPurchase: rate,
           amountInKRW: amountInKrw,
         }
@@ -1113,6 +1116,431 @@ export function resolveInitialCapital(portfolio?: Pick<Portfolio, 'initialCapita
     : PORTFOLIO_STARTING_CAPITAL;
 }
 
+/** logicalName: phase8TransactionHistory — Firestore timestamp → Date */
+export function normalizeTransactionTimestamp(tx: Pick<Transaction, 'timestamp' | 'transactionDate'>): Date {
+  const ts = tx.timestamp;
+  if (ts instanceof Date && !Number.isNaN(ts.getTime())) return ts;
+  if (ts != null && typeof ts === 'object' && typeof (ts as { toDate?: () => Date }).toDate === 'function') {
+    return (ts as { toDate: () => Date }).toDate();
+  }
+  if (tx.transactionDate) {
+    const parsed = new Date(tx.transactionDate);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+  return new Date(0);
+}
+
+/** logicalName: phase8TransactionHistory — 거래 시각 (HH:MM:SS) */
+export function formatTransactionTime(tx: Pick<Transaction, 'timestamp' | 'transactionDate'>): string {
+  const d = normalizeTransactionTimestamp(tx);
+  if (d.getTime() === 0) return '-';
+  return d.toLocaleTimeString('ko-KR', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+}
+
+function resolveTransactionExchangeRate(tx: Transaction): number | undefined {
+  const rate = tx.exchangeRateAtSale ?? tx.exchangeRateAtPurchase ?? tx.exchangeRateAtTransaction;
+  return rate != null && rate > 0 ? rate : undefined;
+}
+
+function inferUsSellPriceUsd(tx: Transaction, rate: number): number {
+  if (tx.priceUsd != null && tx.priceUsd > 0) return tx.priceUsd;
+  const qty = tx.quantity || 1;
+  const amountKrw = Math.round(tx.amountInKRW ?? tx.totalAmount ?? 0);
+  const krwPerShare = amountKrw / qty;
+  if (krwPerShare > 0 && Math.abs(tx.price - krwPerShare) < 2) {
+    return tx.price / rate;
+  }
+  return tx.price;
+}
+
+/** logicalName: phase8TransactionHistory — 거래 상세 정보 행 생성 */
+export function buildTransactionDetailRows(
+  tx: Transaction,
+  options?: { ticker?: string }
+): TransactionDetailRow[] {
+  const rate = resolveTransactionExchangeRate(tx);
+  const isUs = rate != null;
+  const amountKrw = Math.round(tx.amountInKRW ?? tx.totalAmount ?? 0);
+  const qty = tx.quantity || 0;
+  const rows: TransactionDetailRow[] = [];
+
+  if (tx.type === 'BUY') {
+    if (isUs) {
+      const priceUsd = tx.priceUsd ?? tx.price;
+      rows.push({ label: '매수가', value: `${priceUsd.toFixed(2)} USD` });
+    } else {
+      rows.push({ label: '매수가', value: `${formatCommas(Math.round(tx.price))}원` });
+    }
+    rows.push({ label: '수량', value: `${qty}주` });
+    rows.push({ label: '총액', value: `${formatCommas(amountKrw)}원` });
+    if (isUs && rate != null) {
+      rows.push({ label: '환율', value: `${formatCommas(rate)}원/USD` });
+    }
+  } else {
+    if (isUs) {
+      const sellUsd = inferUsSellPriceUsd(tx, rate);
+      rows.push({ label: '매도가', value: `${sellUsd.toFixed(2)} USD` });
+    } else {
+      rows.push({ label: '매도가', value: `${formatCommas(Math.round(tx.price))}원` });
+    }
+    rows.push({ label: '수량', value: `${qty}주` });
+    if (isUs && rate != null) {
+      const sellUsd = inferUsSellPriceUsd(tx, rate);
+      rows.push({
+        label: '총액',
+        value: `${formatCommas(amountKrw)}원 (${sellUsd.toFixed(2)} USD × ${formatCommas(rate)}원/USD)`,
+      });
+    } else {
+      rows.push({ label: '총액', value: `${formatCommas(amountKrw)}원` });
+    }
+    if (tx.averagePriceAtSale != null) {
+      rows.push({
+        label: '평균 매입가',
+        value: isUs
+          ? `${tx.averagePriceAtSale.toFixed(2)} USD`
+          : `${formatCommas(Math.round(tx.averagePriceAtSale))}원`,
+      });
+    }
+    if (tx.realizedProfit != null) {
+      const profit = tx.realizedProfit;
+      rows.push({
+        label: '손익액',
+        value: `${profit >= 0 ? '+' : ''}${formatCommas(profit)}원 ${profit > 0 ? '▲' : profit < 0 ? '▼' : ''}`,
+        valueClass: profit > 0 ? 'text-rose-655' : profit < 0 ? 'text-blue-655' : undefined,
+      });
+    }
+    if (tx.profitRate != null) {
+      const ratePct = tx.profitRate;
+      rows.push({
+        label: '수익률',
+        value: `${ratePct >= 0 ? '+' : ''}${ratePct.toFixed(2)}% ${ratePct > 0 ? '▲' : ratePct < 0 ? '▼' : ''}`,
+        valueClass: ratePct > 0 ? 'text-rose-655' : ratePct < 0 ? 'text-blue-655' : undefined,
+      });
+    }
+    if (isUs && rate != null) {
+      rows.push({ label: '평가환율', value: `${formatCommas(rate)}원/USD` });
+    }
+  }
+
+  rows.push({ label: '시간', value: formatTransactionTime(tx) });
+
+  return rows;
+}
+
+export function formatTransactionAssetLabel(tx: Transaction, ticker?: string): string {
+  const resolved = ticker?.trim() || tx.ticker?.trim();
+  return resolved ? `${tx.assetName} (${resolved})` : tx.assetName;
+}
+
+/** logicalName: phase8TransactionHistory — 자산 purchaseHistory → Transaction */
+export function purchaseRecordToTransaction(assetName: string, record: PurchaseRecord): Transaction {
+  const qty = record.quantity || 0;
+  const amountKrw =
+    record.amountInKRW != null && record.amountInKRW > 0
+      ? Math.round(record.amountInKRW)
+      : Math.round((record.amount || record.price || 0) * (qty > 0 ? qty : 1));
+  const rate = record.exchangeRateAtTransaction;
+  const isUs = rate != null && rate > 0;
+  const priceUsd =
+    isUs && record.type === 'SELL'
+      ? (() => {
+          const qty = record.quantity || 1;
+          const amountKrw =
+            record.amountInKRW != null && record.amountInKRW > 0
+              ? Math.round(record.amountInKRW)
+              : Math.round((record.amount || record.price || 0) * qty);
+          const krwPerShare = amountKrw / qty;
+          if (krwPerShare > 0 && Math.abs(record.price - krwPerShare) < 2) {
+            return record.price / rate;
+          }
+          return record.price;
+        })()
+      : isUs && record.type === 'BUY'
+        ? record.price
+        : undefined;
+
+  return stripUndefinedDeep({
+    id: record.id,
+    assetName: assetName.trim(),
+    type: record.type,
+    quantity: qty,
+    price: record.price,
+    ...(priceUsd != null ? { priceUsd } : {}),
+    totalAmount: amountKrw,
+    amountInKRW: amountKrw,
+    ...(rate != null && rate > 0
+      ? record.type === 'SELL'
+        ? { exchangeRateAtSale: rate, exchangeRateAtPurchase: rate }
+        : { exchangeRateAtPurchase: rate }
+      : {}),
+    ...(record.averagePriceAtSale != null ? { averagePriceAtSale: record.averagePriceAtSale } : {}),
+    ...(record.averageExchangeRateAtSale != null
+      ? { averageExchangeRateAtSale: record.averageExchangeRateAtSale }
+      : {}),
+    transactionDate: record.date,
+    timestamp: record.timestamp ?? record.date,
+    ...(record.realizedProfit != null ? { realizedProfit: record.realizedProfit } : {}),
+    ...(record.realizedProfitRate != null ? { profitRate: record.realizedProfitRate } : {}),
+  }) as Transaction;
+}
+
+/** logicalName: phase8TransactionHistory — portfolios.transactions + purchaseHistory 통합 */
+export function collectPortfolioTransactions(portfolio: Portfolio): Transaction[] {
+  const map = new Map<string, Transaction>();
+
+  for (const tx of portfolio.transactions ?? []) {
+    if (!tx?.id) continue;
+    map.set(tx.id, stripUndefinedDeep({ ...tx }) as Transaction);
+  }
+
+  for (const asset of portfolio.assets ?? []) {
+    const name = asset.name?.trim();
+    if (!name) continue;
+    for (const record of asset.purchaseHistory ?? []) {
+      if (!record?.id || map.has(record.id)) continue;
+      map.set(record.id, purchaseRecordToTransaction(name, record));
+    }
+  }
+
+  return Array.from(map.values()).sort(
+    (a, b) =>
+      normalizeTransactionTimestamp(b).getTime() - normalizeTransactionTimestamp(a).getTime()
+  );
+}
+
+/** logicalName: transactionHistoryPhase8 — 포트폴리오의 모든 거래 조회 (통합 Transaction) */
+export function getAllTransactions(portfolio: Portfolio): Transaction[] {
+  return collectPortfolioTransactions(portfolio);
+}
+
+/** logicalName: transactionHistoryPhase8 — purchaseHistory 원본 + 자산명 */
+export function getPurchaseHistoryRecords(
+  portfolio: Portfolio
+): Array<PurchaseRecord & { assetName: string }> {
+  const records: Array<PurchaseRecord & { assetName: string }> = [];
+  for (const asset of portfolio.assets ?? []) {
+    const name = asset.name?.trim();
+    if (!name || !asset.purchaseHistory?.length) continue;
+    for (const record of asset.purchaseHistory) {
+      records.push({ ...record, assetName: name });
+    }
+  }
+  records.sort((a, b) => {
+    const timeA = normalizeTransactionTimestamp({
+      timestamp: a.timestamp,
+      transactionDate: a.date,
+    });
+    const timeB = normalizeTransactionTimestamp({
+      timestamp: b.timestamp,
+      transactionDate: b.date,
+    });
+    return timeB.getTime() - timeA.getTime();
+  });
+  return records;
+}
+
+/** logicalName: phase8TransactionHistory — 기간 필터 기준일 */
+function getTransactionPeriodCutoff(period: TransactionPeriodFilter): Date | null {
+  if (period === 'ALL') return null;
+  const cutoff = new Date();
+  if (period === '1M') cutoff.setMonth(cutoff.getMonth() - 1);
+  else if (period === '3M') cutoff.setMonth(cutoff.getMonth() - 3);
+  else if (period === '1Y') cutoff.setFullYear(cutoff.getFullYear() - 1);
+  return cutoff;
+}
+
+/** logicalName: transactionHistoryPhase8 — 거래 필터링 */
+export function filterTransactions(
+  transactions: Transaction[],
+  options?: {
+    type?: 'BUY' | 'SELL';
+    assetName?: string;
+    startDate?: Date;
+    endDate?: Date;
+    period?: TransactionPeriodFilter;
+    searchQuery?: string;
+  }
+): Transaction[] {
+  const type = options?.type;
+  const asset = options?.assetName?.trim();
+  const period = options?.period ?? 'ALL';
+  const search = options?.searchQuery?.trim().toLowerCase() ?? '';
+  const cutoff = getTransactionPeriodCutoff(period);
+  const startDate = options?.startDate;
+  const endDate = options?.endDate;
+
+  return transactions.filter((tx) => {
+    if (type && tx.type !== type) return false;
+    if (asset && asset !== 'ALL' && tx.assetName?.trim() !== asset) return false;
+    if (search && !tx.assetName?.toLowerCase().includes(search)) return false;
+
+    const txDate = normalizeTransactionTimestamp(tx);
+    if (cutoff && txDate.getTime() < cutoff.getTime()) return false;
+    if (startDate && txDate.getTime() < startDate.getTime()) return false;
+    if (endDate && txDate.getTime() > endDate.getTime()) return false;
+    return true;
+  });
+}
+
+/** logicalName: phase8TransactionHistory — 거래 목록 필터 (filterTransactions 래퍼) */
+export function filterPortfolioTransactions(
+  transactions: Transaction[],
+  filters: TransactionListFilters
+): Transaction[] {
+  const type =
+    filters.type && filters.type !== 'ALL' ? (filters.type as 'BUY' | 'SELL') : undefined;
+  return filterTransactions(transactions, {
+    type,
+    assetName: filters.assetName,
+    period: filters.period,
+    searchQuery: filters.searchQuery,
+    startDate: filters.startDate,
+    endDate: filters.endDate,
+  });
+}
+
+/** logicalName: phase8TransactionHistory — 매수/매도 통계 */
+export function computeTransactionStats(transactions: Transaction[]): TransactionStats {
+  let buyCount = 0;
+  let sellCount = 0;
+  let totalBuyAmountKrw = 0;
+  let totalSellAmountKrw = 0;
+  let totalRealizedProfitKrw = 0;
+  let profitRateSum = 0;
+  let profitRateCount = 0;
+  const assetNames = new Set<string>();
+  const monthlyMap = new Map<string, number>();
+
+  for (const tx of transactions) {
+    const name = tx.assetName?.trim();
+    if (name) assetNames.add(name);
+    const amount = Math.round(tx.amountInKRW ?? tx.totalAmount ?? 0);
+    const txDate = normalizeTransactionTimestamp(tx);
+    const monthKey = `${txDate.getFullYear()}-${String(txDate.getMonth() + 1).padStart(2, '0')}`;
+    monthlyMap.set(monthKey, (monthlyMap.get(monthKey) ?? 0) + 1);
+
+    if (tx.type === 'BUY') {
+      buyCount += 1;
+      totalBuyAmountKrw += amount;
+    } else {
+      sellCount += 1;
+      totalSellAmountKrw += amount;
+      totalRealizedProfitKrw += tx.realizedProfit ?? 0;
+      if (tx.profitRate != null && Number.isFinite(tx.profitRate)) {
+        profitRateSum += tx.profitRate;
+        profitRateCount += 1;
+      }
+    }
+  }
+
+  const monthlyBreakdown: TransactionMonthlyStat[] = Array.from(monthlyMap.entries())
+    .map(([monthKey, count]) => ({
+      monthKey,
+      label: `${parseInt(monthKey.split('-')[1] ?? '0', 10)}월`,
+      count,
+    }))
+    .sort((a, b) => b.monthKey.localeCompare(a.monthKey));
+
+  return {
+    totalCount: transactions.length,
+    buyCount,
+    sellCount,
+    totalBuyAmountKrw: Math.round(totalBuyAmountKrw),
+    totalSellAmountKrw: Math.round(totalSellAmountKrw),
+    totalRealizedProfitKrw: Math.round(totalRealizedProfitKrw),
+    uniqueAssetCount: assetNames.size,
+    averageProfitRate: profitRateCount > 0 ? profitRateSum / profitRateCount : 0,
+    monthlyBreakdown,
+  };
+}
+
+/** logicalName: transactionHistoryPhase8 — 통계 계산 (computeTransactionStats 별칭) */
+export function calculateTransactionStats(transactions: Transaction[]): TransactionStats {
+  return computeTransactionStats(transactions);
+}
+
+/** logicalName: transactionHistoryPhase8 — 목록용 가격 × 수량 텍스트 */
+export function formatTransactionPriceQuantity(tx: Transaction): string {
+  const rate = resolveTransactionExchangeRate(tx);
+  const qty = tx.quantity || 0;
+  if (rate != null) {
+    const usd =
+      tx.type === 'BUY' ? tx.priceUsd ?? tx.price : inferUsSellPriceUsd(tx, rate);
+    return `${usd.toFixed(2)} USD × ${qty}주`;
+  }
+  return `${formatCommas(Math.round(tx.price))}원 × ${qty}주`;
+}
+
+/** logicalName: transactionHistoryPhase8 — 날짜 + 시간 */
+export function formatTransactionDateTime(tx: Transaction): string {
+  const d = normalizeTransactionTimestamp(tx);
+  if (d.getTime() === 0) return tx.transactionDate || '-';
+  const date = tx.transactionDate || d.toISOString().slice(0, 10);
+  return `${date} ${formatTransactionTime(tx)}`;
+}
+
+function csvEscape(value: string | number | undefined | null): string {
+  const text = value == null ? '' : String(value);
+  if (/[",\n]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
+  return text;
+}
+
+/** logicalName: transactionHistoryPhase8 — CSV 내보내기 */
+export function exportTransactionsToCsv(transactions: Transaction[]): string {
+  const headers = [
+    '날짜',
+    '시간',
+    '유형',
+    '자산명',
+    '티커',
+    '단가',
+    '수량',
+    '총액(KRW)',
+    '손익(KRW)',
+    '수익률(%)',
+  ];
+  const rows = transactions.map((tx) => {
+    const amountKrw = Math.round(tx.amountInKRW ?? tx.totalAmount ?? 0);
+    const rate = resolveTransactionExchangeRate(tx);
+    const unitPrice =
+      rate != null
+        ? `${(tx.type === 'BUY' ? tx.priceUsd ?? tx.price : inferUsSellPriceUsd(tx, rate)).toFixed(2)} USD`
+        : `${Math.round(tx.price)} KRW`;
+    return [
+      tx.transactionDate || normalizeTransactionTimestamp(tx).toISOString().slice(0, 10),
+      formatTransactionTime(tx),
+      tx.type,
+      tx.assetName,
+      tx.ticker ?? '',
+      unitPrice,
+      tx.quantity,
+      amountKrw,
+      tx.realizedProfit ?? '',
+      tx.profitRate != null ? tx.profitRate.toFixed(2) : '',
+    ]
+      .map(csvEscape)
+      .join(',');
+  });
+  return [headers.join(','), ...rows].join('\n');
+}
+
+/** logicalName: phase8TransactionHistory — Firestore에서 거래 이력 조회 */
+export async function fetchPortfolioTransactions(nickname: string): Promise<Transaction[]> {
+  const trimmed = nickname.trim();
+  if (!trimmed) return [];
+
+  const snap = await getDoc(doc(db, 'portfolios', trimmed));
+  if (!snap.exists()) return [];
+
+  const portfolio = { nickname: trimmed, ...snap.data() } as Portfolio;
+  return collectPortfolioTransactions(portfolio);
+}
+
 /** logicalName: totalProfitRateCalculationFix — 신규 포트폴리오 초기 문서 */
 export function createPortfolio(nickname: string, exchangeRate: number = DEFAULT_EXCHANGE_RATE): Portfolio {
   const initialCapital = PORTFOLIO_STARTING_CAPITAL;
@@ -1133,6 +1561,7 @@ export function createPortfolio(nickname: string, exchangeRate: number = DEFAULT
     cumulativeRealizedProfit: 0,
     totalBudget: initialCapital,
     hasRealPrices: false,
+    transactions: [],
     updatedAt: new Date(),
   };
 }
@@ -1573,6 +2002,7 @@ export async function sellAsset(
     catalogPrices
   );
 
+  const sellPresetTicker = getPresetByName(trimmedName)?.ticker;
   const transaction: Transaction = stripUndefinedDeep({
     id: sellRecord.id,
     assetName: trimmedName,
@@ -1581,9 +2011,18 @@ export async function sellAsset(
     price: sellPriceKrw,
     totalAmount: sellAmount,
     amountInKRW: sellAmount,
-    exchangeRateAtPurchase: isUsAsset ? exchangeRate : undefined,
-    averagePriceAtSale: isUsAsset ? purchaseUsd : purchasePriceKrw,
-    averageExchangeRateAtSale: isUsAsset ? purchaseRate : undefined,
+    ...(sellPresetTicker ? { ticker: sellPresetTicker } : {}),
+    ...(isUsAsset
+      ? {
+          priceUsd: sellPriceUsd != null ? Math.round(sellPriceUsd * 100) / 100 : undefined,
+          exchangeRateAtSale: exchangeRate,
+          exchangeRateAtPurchase: exchangeRate,
+          averagePriceAtSale: purchaseUsd,
+          averageExchangeRateAtSale: purchaseRate,
+        }
+      : {
+          averagePriceAtSale: purchasePriceKrw,
+        }),
     realizedProfit,
     profitRate: Math.round(profitRate * 100) / 100,
     transactionDate: sellRecord.date,

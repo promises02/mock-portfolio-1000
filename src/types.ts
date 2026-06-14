@@ -124,20 +124,83 @@ export type MarketPriceMap = Record<string, number>;
 export interface Transaction {
   id: string; // 거래 ID
   assetName: string; // 자산명
+  /** 티커 심볼 (예: 000660, MU) */
+  ticker?: string;
   type: 'BUY' | 'SELL'; // 거래 종류
   quantity: number; // 수량
-  price: number; // 거래 당시 단가
-  totalAmount: number; // 수량 × 단가
+  /** 거래 당시 단가 — 미국 주식 매수/매도(legacy): USD, 국내·매도(KRW저장): KRW */
+  price: number;
+  /** 미국 주식 단가 (USD) — 표시용 */
+  priceUsd?: number;
+  /** KRW 환산 총 거래금액 */
+  totalAmount: number;
   /** 미국 주식 매수/매도 시 적용 환율 */
   exchangeRateAtPurchase?: number;
-  /** KRW 환산 거래금액 */
+  /** 매도 시 평가 환율 (미국 주식) */
+  exchangeRateAtSale?: number;
+  /** @deprecated exchangeRateAtPurchase 와 동일 — 하위 호환 */
+  exchangeRateAtTransaction?: number;
+  /** KRW 환산 거래금액 (totalAmount와 동일 권장) */
   amountInKRW?: number;
   averagePriceAtSale?: number;
   averageExchangeRateAtSale?: number;
-  transactionDate: string; // 거래 날짜
+  transactionDate: string; // 거래 날짜 (YYYY-MM-DD)
   timestamp: any; // Firestore timestamp
   realizedProfit?: number; // 매도 실현 손익 (KRW)
   profitRate?: number; // 매도 수익률 (%)
+}
+
+/** logicalName: phase8TransactionHistory — 거래 상세 UI 한 줄 */
+export interface TransactionDetailRow {
+  label: string;
+  value: string;
+  valueClass?: string;
+}
+
+/** logicalName: phase8TransactionHistory — 메인 화면 탭 */
+export type PortfolioMainTab = 'portfolio' | 'transactions' | 'settings';
+
+export type TransactionFilterType = 'ALL' | 'BUY' | 'SELL';
+
+export type TransactionPeriodFilter = 'ALL' | '1M' | '3M' | '1Y';
+
+export interface TransactionMonthlyStat {
+  monthKey: string;
+  label: string;
+  count: number;
+}
+
+/** logicalName: phase8TransactionHistory — 거래 통계 요약 */
+export interface TransactionStats {
+  totalCount: number;
+  buyCount: number;
+  sellCount: number;
+  totalBuyAmountKrw: number;
+  totalSellAmountKrw: number;
+  totalRealizedProfitKrw: number;
+  uniqueAssetCount: number;
+  /** 매도 거래 profitRate 평균 (%) */
+  averageProfitRate: number;
+  monthlyBreakdown: TransactionMonthlyStat[];
+}
+
+export interface TransactionListFilters {
+  type?: TransactionFilterType;
+  assetName?: string;
+  period?: TransactionPeriodFilter;
+  searchQuery?: string;
+  startDate?: Date;
+  endDate?: Date;
+}
+
+/** logicalName: transactionHistoryPhase8 — 거래 이력 UI 필터 상태 */
+export interface TransactionFilterState {
+  type: TransactionFilterType;
+  assetName: string;
+  searchQuery: string;
+  period: TransactionPeriodFilter;
+  page: number;
+  pageSize: number;
 }
 
 export interface Portfolio {
