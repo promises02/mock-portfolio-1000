@@ -32,7 +32,7 @@ export const RECOMMENDED_ASSETS: RecommendedAsset[] = [
 
 export const DOMESTIC_PRESETS: PresetAsset[] = [
   { name: 'SK하이닉스', type: 'stock', price: 2150000 },
-  { name: '삼성전자', type: 'stock', price: 318500 },
+  { name: '삼성전자', type: 'stock', price: 322500 },
   { name: '현대차', type: 'stock', price: 607000 },
   { name: '두산에너빌리티', type: 'stock', price: 106805 },
   { name: 'TIGER 반도체TOP10', type: 'etf', price: 53000 },

@@ -84,7 +84,7 @@ export const CustomAssetModal: React.FC<CustomAssetModalProps> = ({
       ? '981.61'
       : effectiveDisplayCurrency === 'CRYPTO'
         ? '0.0532'
-        : '318500';
+        : '322500';
 
   const validateForm = (): boolean => {
     setError('');

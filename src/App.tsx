@@ -951,11 +951,8 @@ export default function App() {
 
   const renderPortfolioSubNav = () => (
     <div className="bg-white border-b border-slate-200" data-logical-name="phase8TransactionHistory">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
-        <h2 className="text-base sm:text-lg font-black text-slate-800 tracking-tight uppercase font-mono">
-          INVEST10M <span className="text-slate-400 font-bold">—</span> {nickname}
-        </h2>
-        <nav className="flex flex-wrap gap-2 mt-4" aria-label="포트폴리오 메인 탭">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3">
+        <nav className="flex flex-wrap gap-2" aria-label="포트폴리오 메인 탭">
           {mainTabItems.map((tab) => (
             <button
               key={tab.id}

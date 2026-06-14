@@ -2351,7 +2351,9 @@ function toAdminAssetPayload(asset: CustomAsset): CustomAsset {
   };
 }
 
-async function parseAdminApiResponse(response: Response): Promise<AdminPriceUpdateResult> {
+async function parseAdminApiResponse(
+  response: Response
+): Promise<AdminPriceUpdateResult & { shouldFallback?: boolean }> {
   const text = await response.text();
   if (!text.trim()) {
     if (response.status === 404) {
@@ -2359,11 +2361,13 @@ async function parseAdminApiResponse(response: Response): Promise<AdminPriceUpda
         success: false,
         message:
           '관리자 API를 찾을 수 없습니다. 터미널에서 npm run dev 로 서버를 재시작한 뒤 다시 시도해주세요.',
+        shouldFallback: true,
       };
     }
     return {
       success: false,
       message: `서버 응답이 비어 있습니다 (HTTP ${response.status}).`,
+      shouldFallback: !response.ok,
     };
   }
 
@@ -2373,6 +2377,7 @@ async function parseAdminApiResponse(response: Response): Promise<AdminPriceUpda
       return {
         success: false,
         message: data.message || '저장 중 오류가 발생했습니다.',
+        shouldFallback: response.status === 404,
       };
     }
     return data;
@@ -2380,8 +2385,131 @@ async function parseAdminApiResponse(response: Response): Promise<AdminPriceUpda
     return {
       success: false,
       message: '서버 응답을 처리하지 못했습니다.',
+      shouldFallback: true,
     };
   }
+}
+
+async function writeSharedMarketPriceClient(assetName: string, priceKrw: number): Promise<void> {
+  const trimmed = assetName.trim();
+  const sharedSnap = await getDoc(sharedConfigRef());
+  const existing = (sharedSnap.data() ?? {}) as Record<string, unknown>;
+  const marketPrices = {
+    ...parseSharedMarketPrices(existing),
+    [trimmed]: priceKrw,
+  };
+
+  await setDoc(
+    sharedConfigRef(),
+    stripUndefinedDeep({
+      nickname: SHARED_CONFIG_DOC_ID,
+      assets: [],
+      savings: 0,
+      totalCurrentValue: 0,
+      profitRate: 0,
+      profitAmount: 0,
+      hasRealPrices: false,
+      marketPrices,
+      ...(typeof existing.exchangeRate === 'number' ? { exchangeRate: existing.exchangeRate } : {}),
+      updatedAt: new Date(),
+    }),
+    { merge: true }
+  );
+}
+
+/** logicalName: transactionHistoryPhase8 — Vercel 등 정적 배포용 Firestore 직접 시세 수정 */
+async function updateAdminAssetPriceDirect(
+  asset: CustomAsset,
+  newPrice: number,
+  reason: AdminPriceUpdateReason
+): Promise<AdminPriceUpdateResult> {
+  if (!isAdminSessionActive()) {
+    return { success: false, message: '관리자 권한이 없습니다.' };
+  }
+
+  const assetId = asset.id?.trim();
+  if (!assetId) {
+    return { success: false, message: '자산 ID가 필요합니다.' };
+  }
+
+  const docId = assetId.startsWith(PRESET_ASSET_ID_PREFIX)
+    ? sanitizeDocId(asset.name.trim())
+    : assetId;
+  const exchangeRate = await getGlobalExchangeRate();
+  const snap = await getDoc(doc(db, 'customAssets', docId));
+  const existing: CustomAsset = snap.exists()
+    ? ({ ...(snap.data() as CustomAsset), id: docId } as CustomAsset)
+    : asset;
+
+  const marketRegion = existing.marketRegion ?? inferAssetMarketRegion(existing.name, existing.type);
+  const displayCurrency = existing.displayCurrency ?? getDefaultDisplayCurrency(marketRegion);
+  const now = new Date();
+
+  const meta = {
+    lastUpdatedBy: 'admin' as const,
+    lastUpdatedAt: now,
+    updateReason: reason,
+    priceSource: 'admin',
+    lastPriceUpdatedAt: now,
+  };
+
+  const payload: Partial<CustomAsset> = { ...meta };
+
+  if (displayCurrency === 'USD') {
+    payload.priceUSD = newPrice;
+    payload.price = Math.round(computeKrwEquivalent('USD', newPrice, exchangeRate));
+  } else if (displayCurrency === 'CRYPTO') {
+    payload.priceCrypto = String(newPrice);
+    payload.price = Math.round(computeKrwEquivalent('CRYPTO', newPrice, exchangeRate));
+  } else {
+    payload.priceKRW = newPrice;
+    payload.price = Math.round(newPrice);
+  }
+
+  const priceKrw = payload.price!;
+
+  await writeSharedMarketPriceClient(existing.name, priceKrw);
+
+  const baseFields: Partial<CustomAsset> = snap.exists()
+    ? {}
+    : stripUndefinedDeep({
+        name: existing.name,
+        type: existing.type,
+        ticker: existing.ticker,
+        market: existing.market,
+        marketRegion,
+        displayCurrency,
+        addedBy: 'admin',
+        addedAt: now,
+      });
+
+  await setDoc(
+    doc(db, 'customAssets', docId),
+    stripUndefinedDeep({ ...baseFields, ...payload }),
+    { merge: true }
+  );
+
+  await setDoc(
+    doc(db, 'customPrices', existing.name.trim()),
+    {
+      price: priceKrw,
+      updatedAt: now,
+      source: 'admin_override',
+      lastUpdatedBy: 'admin',
+      updateReason: reason,
+    },
+    { merge: true }
+  );
+
+  const formattedPrice =
+    displayCurrency === 'USD'
+      ? `${newPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD`
+      : `${Math.round(newPrice).toLocaleString('ko-KR')}원`;
+
+  return {
+    success: true,
+    message: `✅ ${existing.name} 가격이 ${formattedPrice}으로 업데이트되었습니다.\n   모든 사용자의 포트폴리오에 반영됩니다.`,
+  };
 }
 
 /** logicalName: multiCurrencySupport — 관리자 환율 조회 */
@@ -2577,13 +2705,26 @@ export async function updateAdminAssetPrice(
       }),
     });
 
-    return parseAdminApiResponse(response);
+    const apiResult = await parseAdminApiResponse(response);
+    if (apiResult.success) {
+      return apiResult;
+    }
+    if (apiResult.shouldFallback) {
+      console.info('[updateAdminAssetPrice] API unavailable — falling back to Firestore direct write');
+      return updateAdminAssetPriceDirect(asset, newPrice, reason);
+    }
+    return apiResult;
   } catch (error) {
-    console.error('[updateAdminAssetPrice] failed:', error);
-    return {
-      success: false,
-      message: error instanceof Error ? error.message : '저장 중 오류가 발생했습니다.',
-    };
+    console.warn('[updateAdminAssetPrice] API failed — falling back to Firestore direct write:', error);
+    try {
+      return await updateAdminAssetPriceDirect(asset, newPrice, reason);
+    } catch (directError) {
+      console.error('[updateAdminAssetPrice] direct write failed:', directError);
+      return {
+        success: false,
+        message: error instanceof Error ? error.message : '저장 중 오류가 발생했습니다.',
+      };
+    }
   }
 }
 

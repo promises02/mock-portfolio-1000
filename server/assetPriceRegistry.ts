@@ -38,7 +38,7 @@ export const ASSET_PRICE_REGISTRY: AssetPriceConfig[] = [
     yahooSymbol: '000660.KS',
     aliases: ['sk하이닉스', 'skhynix', '하이닉스'],
   }),
-  entry('삼성전자', 'kr', 318500, 'https://finance.naver.com/item/main.naver?code=005930', {
+  entry('삼성전자', 'kr', 322500, 'https://finance.naver.com/item/main.naver?code=005930', {
     naverCode: '005930',
     yahooSymbol: '005930.KS',
     aliases: ['samsung', '삼전', '삼성'],

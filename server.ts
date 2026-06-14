@@ -211,24 +211,24 @@ async function startServer() {
       reasoning: 'SK하이닉스 설정가(2,150,000원) 반영 완료.'
     },
     '삼성전자': {
-      currentPrice: 318500,
+      currentPrice: 322500,
       sourceUrl: 'https://finance.naver.com/item/main.naver?code=005930',
-      reasoning: '한국 거래소(KRX) 삼성전자 설정 가격(318,500원) 연동 완료.'
+      reasoning: '한국 거래소(KRX) 삼성전자 설정 가격(322,500원) 연동 완료.'
     },
     'samsung': {
-      currentPrice: 318500,
+      currentPrice: 322500,
       sourceUrl: 'https://finance.naver.com/item/main.naver?code=005930',
-      reasoning: '한국 거래소(KRX) 삼성전자 설정 가격(318,500원) 연동 완료.'
+      reasoning: '한국 거래소(KRX) 삼성전자 설정 가격(322,500원) 연동 완료.'
     },
     '삼전': {
-      currentPrice: 318500,
+      currentPrice: 322500,
       sourceUrl: 'https://finance.naver.com/item/main.naver?code=005930',
-      reasoning: '한국 거래소(KRX) 삼성전자 설정 가격(318,500원) 연동 완료.'
+      reasoning: '한국 거래소(KRX) 삼성전자 설정 가격(322,500원) 연동 완료.'
     },
     '삼성': {
-      currentPrice: 318500,
+      currentPrice: 322500,
       sourceUrl: 'https://finance.naver.com/item/main.naver?code=005930',
-      reasoning: '한국 거래소(KRX) 삼성전자 설정 가격(318,500원) 연동 완료.'
+      reasoning: '한국 거래소(KRX) 삼성전자 설정 가격(322,500원) 연동 완료.'
     },
     'tiger반도체top10': {
       currentPrice: 53000,
