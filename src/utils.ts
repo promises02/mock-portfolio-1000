@@ -61,7 +61,7 @@ function resolvePurchaseExchangeRateFromAsset(
   if (asset.purchaseExchangeRate != null && asset.purchaseExchangeRate > 0) {
     return asset.purchaseExchangeRate;
   }
-  const purchaseUsd = asset.purchasePriceUSD ?? asset.priceUSD;
+  const purchaseUsd = asset.purchasePriceUSD;
   if (purchaseUsd != null && purchaseUsd > 0 && asset.price > 0) {
     return Math.round(asset.price / purchaseUsd);
   }
@@ -134,21 +134,19 @@ export function getDisplayPrice(
   const displayCurrency = resolveDisplayCurrency(asset);
 
   if (displayCurrency === 'USD') {
-    const usd =
-      options?.priceUsd ??
-      asset.priceUSD ??
-      asset.purchasePriceUSD ??
-      (exchangeRate > 0 && (options?.priceKrw ?? asset.priceKRW ?? asset.price)
-        ? (options?.priceKrw ?? asset.priceKRW ?? asset.price) / exchangeRate
-        : 0);
     const krw = Math.round(
       options?.priceKrw ??
         asset.priceKRW ??
         asset.price ??
-        convertToKRW(usd, exchangeRate)
+        (options?.priceUsd != null
+          ? convertToKRW(options.priceUsd, DEFAULT_EXCHANGE_RATE)
+          : asset.priceUSD != null
+            ? convertToKRW(asset.priceUSD, DEFAULT_EXCHANGE_RATE)
+            : asset.purchasePriceUSD != null
+              ? convertToKRW(asset.purchasePriceUSD, DEFAULT_EXCHANGE_RATE)
+              : 0)
     );
-    const usdLabel = usd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    return `${usdLabel} USD · ${formatCommas(krw)}원`;
+    return `${formatCommas(krw)}원`;
   }
 
   if (displayCurrency === 'CRYPTO') {
@@ -183,15 +181,9 @@ export function getAssetYieldPercent(
   const market = asset.market ?? inferAssetMarketRegion(asset.name, asset.type || 'stock');
 
   if (market === 'US') {
-    const purchaseUsd =
-      asset.purchasePriceUSD ??
-      asset.priceUSD ??
-      (resolvePurchaseExchangeRateFromAsset(asset, exchangeRate) > 0 && asset.price > 0
-        ? asset.price / resolvePurchaseExchangeRateFromAsset(asset, exchangeRate)
-        : 0);
-    const currentUsd = exchangeRate > 0 ? currentPriceKrw / exchangeRate : 0;
-    if (purchaseUsd <= 0) return 0;
-    return ((currentUsd - purchaseUsd) / purchaseUsd) * 100;
+    const purchaseKrw = asset.price > 0 ? asset.price : 0;
+    if (purchaseKrw <= 0) return 0;
+    return ((currentPriceKrw - purchaseKrw) / purchaseKrw) * 100;
   }
 
   if (asset.price <= 0) return 0;
@@ -297,6 +289,9 @@ const KNOWN_ASSET_COLORS: Record<string, string> = {
   'asml': '#38BDF8',            // Sky Light Blue
   '시놉시스': '#0369A1',          // Muted Ocean Blue
   'synopsys': '#0369A1',
+  '마이크론': '#3730A3',           // Deep Indigo Blue
+  'micron': '#3730A3',
+  'mu': '#3730A3',
 
   // ☁️ 빅테크·플랫폼: 보라색 계열
   '알파벳 Class A': '#8B5CF6',   // Royal Violet
@@ -422,7 +417,7 @@ export function getAssetColor(name: string): string {
   const idx = Math.abs(hash);
 
   // Sector keyword matching fallback to ensure any user-typed asset matches colors of requested groups
-  if (norm.includes('삼성전자') || norm.includes('samsung') || norm.includes('하이닉스') || norm.includes('hynix') || norm.includes('반도체') || norm.includes('엔비디아') || norm.includes('nvidia') || norm.includes('amd') || norm.includes('broadcom') || norm.includes('tsmc') || norm.includes('asml') || norm.includes('synopsys')) {
+  if (norm.includes('삼성전자') || norm.includes('samsung') || norm.includes('하이닉스') || norm.includes('hynix') || norm.includes('반도체') || norm.includes('엔비디아') || norm.includes('nvidia') || norm.includes('amd') || norm.includes('broadcom') || norm.includes('tsmc') || norm.includes('asml') || norm.includes('synopsys') || norm.includes('시놉시스') || norm.includes('micron') || norm.includes('마이크론')) {
     return SECTOR_SHADES.ai[idx % SECTOR_SHADES.ai.length];
   }
   if (norm.includes('알파벳') || norm.includes('alphabet') || norm.includes('google') || norm.includes('구글') || norm.includes('아마존') || norm.includes('amazon') || norm.includes('애플') || norm.includes('apple') || norm.includes('메타') || norm.includes('meta') || norm.includes('마이크로소프트') || norm.includes('microsoft') || norm.includes('넷플릭스') || norm.includes('netflix') || norm.includes('팔란티어') || norm.includes('palantir')) {
@@ -487,7 +482,8 @@ export function inferAssetMarket(name: string, type: string): string {
     'amd', 'nvidia', '엔비디아', 'microsoft', '마이크로소프트', 'apple', '애플', 
     'alphabet', '알파벳', 'amazon', '아마존', 'meta', '메타', 'broadcom', '브로드컴', 
     'spy', 'voo', 'qqq', 'schd', 'jepi', 'tsmc', 'asml', 'palantir', '팔란티어', 
-    'synopsys', '시놉시스', 'nokia', '노키아', 'lockheed', '록히드마틴', 'lumentum', '루멘텀'
+    'synopsys', '시놉시스', 'nokia', '노키아', 'lockheed', '록히드마틴', 'lumentum', '루멘텀',
+    'tesla', '테슬라', 'tsla', 'micron', '마이크론'
   ];
   if (usKeywords.some(kw => norm.includes(kw))) {
     return '미국 주식';
@@ -522,14 +518,14 @@ export function inferAssetSector(name: string, type: string): string {
   if (norm.includes('현금') || norm.includes('cash') || norm.includes('파킹') || norm.includes('예금')) {
     return '현금';
   }
-  if (norm.includes('삼성전자') || norm.includes('samsung') || norm.includes('하이닉스') || norm.includes('hynix') || norm.includes('반도체') || norm.includes('엔비디아') || norm.includes('nvidia') || norm.includes('amd') || norm.includes('broadcom') || norm.includes('tsmc') || norm.includes('asml') || norm.includes('synopsys') || norm.includes('시놉시스') || norm.includes('루멘텀') || norm.includes('lumentum')) {
+  if (norm.includes('삼성전자') || norm.includes('samsung') || norm.includes('하이닉스') || norm.includes('hynix') || norm.includes('반도체') || norm.includes('엔비디아') || norm.includes('nvidia') || norm.includes('amd') || norm.includes('broadcom') || norm.includes('tsmc') || norm.includes('asml') || norm.includes('synopsys') || norm.includes('시놉시스') || norm.includes('micron') || norm.includes('마이크론') || norm.includes('루멘텀') || norm.includes('lumentum')) {
     return '반도체';
   }
   if (norm.includes('알파벳') || norm.includes('alphabet') || norm.includes('google') || norm.includes('구글') || norm.includes('아마존') || norm.includes('amazon') || norm.includes('애플') || norm.includes('apple') || norm.includes('메타') || norm.includes('meta') || norm.includes('마이크로소프트') || norm.includes('microsoft') || norm.includes('넷플릭스') || norm.includes('netflix') || norm.includes('팔란티어') || norm.includes('palantir')) {
     return '정보기술(IT)';
   }
   if (norm.includes('현대차') || norm.includes('기아') || norm.includes('kia') || norm.includes('tesla') || norm.includes('테슬라') || norm.includes('tsla') || norm.includes('자동차')) {
-    return '경기소비재';
+    return '자동차';
   }
   if (norm.includes('브룩필드') || norm.includes('brookfield') || norm.includes('금융') || norm.includes('finance') || norm.includes('은행') || norm.includes('증권') || norm.includes('보험')) {
     return '금융';
@@ -558,4 +554,22 @@ export function inferAssetSector(name: string, type: string): string {
   if (type === 'commodity') return '원자재';
 
   return '기타';
+}
+
+/** 차트·UI용 — 이름 기반 추론 우선 (Firestore에 저장된 잘못된 sector 보정) */
+export function resolveAssetSector(
+  asset: Pick<AssetItem, 'name' | 'type' | 'sector'>
+): string {
+  const inferred = inferAssetSector(asset.name, asset.type || 'stock');
+  if (inferred !== '기타') return inferred;
+  return asset.sector?.trim() || '기타';
+}
+
+/** 차트·UI용 — 이름 기반 추론 우선 */
+export function resolveAssetMarketGroup(
+  asset: Pick<AssetItem, 'name' | 'type' | 'marketGroup'>
+): string {
+  const inferred = inferAssetMarket(asset.name, asset.type || 'stock');
+  if (inferred !== '기타') return inferred;
+  return asset.marketGroup?.trim() || '기타';
 }

@@ -9,6 +9,7 @@ import {
   FOREIGN_PRESETS,
   CRYPTO_PRESETS,
   PresetAsset,
+  getUsAssetDisplayName,
 } from '../presets';
 import {
   formatCommas,
@@ -31,6 +32,7 @@ import { AssetSearchAndAdd } from './AssetSearchAndAdd';
 interface PickableAsset {
   id: string;
   name: string;
+  displayName?: string;
   type: AssetType;
   marketRegion: AssetMarket;
   priceKRW: number;
@@ -40,6 +42,34 @@ interface PickableAsset {
 }
 
 type AssetTab = 'domestic' | 'foreign' | 'crypto' | 'custom';
+type AssetSortOrder = 'name-asc' | 'price-desc' | 'price-asc';
+
+const FOREIGN_PRESET_NAME_KEYS = new Set(
+  FOREIGN_PRESETS.map((preset) => preset.name.trim().toLowerCase())
+);
+const DOMESTIC_PRESET_NAME_KEYS = new Set(
+  DOMESTIC_PRESETS.map((preset) => preset.name.trim().toLowerCase())
+);
+const CRYPTO_PRESET_NAME_KEYS = new Set(
+  CRYPTO_PRESETS.map((preset) => preset.name.trim().toLowerCase())
+);
+
+function presetNameKey(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+function resolvePickableMarketRegion(
+  name: string,
+  type: AssetType,
+  stored?: AssetMarket
+): AssetMarket {
+  const key = presetNameKey(name);
+  if (FOREIGN_PRESET_NAME_KEYS.has(key)) return 'US';
+  if (DOMESTIC_PRESET_NAME_KEYS.has(key)) return 'Korea';
+  if (CRYPTO_PRESET_NAME_KEYS.has(key)) return 'Crypto';
+  if (stored) return stored;
+  return inferAssetMarketRegion(name, type);
+}
 
 const TYPE_SHORT_LABEL: Partial<Record<AssetType, string>> = {
   stock: '주식',
@@ -128,6 +158,7 @@ function presetToPickable(
   return {
     id: rec?.id ?? fallbackId.replace(/[/\\.#$[\]]/g, '_'),
     name: preset.name,
+    displayName: marketRegion === 'US' ? getUsAssetDisplayName(preset.name) : undefined,
     type: preset.type,
     marketRegion,
     priceKRW,
@@ -144,10 +175,13 @@ function customToPickable(
   catalogPrices?: CatalogPriceMap
 ): PickableAsset | null {
   const normalized = normalizeCustomAsset(asset, asset.id);
-  const marketRegion =
-    normalized.marketRegion ?? inferAssetMarketRegion(normalized.name, normalized.type);
+  const marketRegion = resolvePickableMarketRegion(
+    normalized.name,
+    normalized.type,
+    normalized.marketRegion
+  );
   const preset = FOREIGN_PRESETS.find(
-    (p) => p.name.trim().toLowerCase() === normalized.name.trim().toLowerCase()
+    (p) => presetNameKey(p.name) === presetNameKey(normalized.name)
   );
   const priceUSD = resolvePickablePriceUSD(normalized, preset?.usdPrice);
   const basePriceKRW = resolvePickablePriceKRW(normalized, exchangeRate);
@@ -157,6 +191,7 @@ function customToPickable(
   return {
     id: normalized.id,
     name: normalized.name,
+    displayName: marketRegion === 'US' ? getUsAssetDisplayName(normalized.name) : undefined,
     type: normalized.type,
     marketRegion,
     priceKRW,
@@ -180,6 +215,43 @@ function mergePickablesByName(presets: PickableAsset[], customs: PickableAsset[]
 
 function formatUsdPrice(usd: number): string {
   return usd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function resolvePickableDisplayPriceKrw(
+  asset: PickableAsset,
+  exchangeRate: number,
+  marketPrices?: Record<string, number>,
+  catalogPrices?: CatalogPriceMap
+): number {
+  const isUsAsset = asset.marketRegion === 'US' && asset.priceUSD != null && asset.priceUSD > 0;
+  const baseKrw = isUsAsset
+    ? Math.round(convertToKRW(asset.priceUSD!, exchangeRate))
+    : asset.priceKRW;
+  return resolveMarketPriceKRW(asset.name, baseKrw, marketPrices, catalogPrices);
+}
+
+function sortPickableAssets(
+  assets: PickableAsset[],
+  order: AssetSortOrder,
+  exchangeRate: number,
+  marketPrices?: Record<string, number>,
+  catalogPrices?: CatalogPriceMap
+): PickableAsset[] {
+  const sorted = [...assets];
+  if (order === 'name-asc') {
+    sorted.sort((a, b) =>
+      (a.displayName ?? a.name).localeCompare(b.displayName ?? b.name, 'ko')
+    );
+    return sorted;
+  }
+  const withPrice = sorted.map((asset) => ({
+    asset,
+    price: resolvePickableDisplayPriceKrw(asset, exchangeRate, marketPrices, catalogPrices),
+  }));
+  withPrice.sort((a, b) =>
+    order === 'price-desc' ? b.price - a.price : a.price - b.price
+  );
+  return withPrice.map(({ asset }) => asset);
 }
 
 interface BuyAssetModalProps {
@@ -338,7 +410,9 @@ export const BuyAssetModal: React.FC<BuyAssetModalProps> = ({
         data-logical-name="tradingSystemPhase5"
       >
         <div className="flex items-center justify-between px-5 py-3 border-b border-slate-100 bg-slate-50">
-          <h3 className="text-sm font-extrabold text-slate-800">{asset.name} 매수</h3>
+          <h3 className="text-sm font-extrabold text-slate-800">
+            {(asset.displayName ?? asset.name)} 매수
+          </h3>
           <button
             type="button"
             onClick={onClose}
@@ -489,7 +563,7 @@ const CompactAssetCard: React.FC<{
       </div>
       <div>
         <p className={`text-[13px] font-semibold text-slate-800 truncate leading-tight`}>
-          {asset.name}
+          {asset.displayName ?? asset.name}
           {asset.isCustom && (
             <span className="ml-0.5 text-[8px] font-black text-orange-600 align-middle">CUSTOM</span>
           )}
@@ -549,6 +623,7 @@ export const RecommendedAssetsSection: React.FC<RecommendedAssetsSectionProps> =
   onPersistPortfolio,
 }) => {
   const [activeTab, setActiveTab] = useState<AssetTab>('domestic');
+  const [sortOrder, setSortOrder] = useState<AssetSortOrder>('name-asc');
   const [selectedAsset, setSelectedAsset] = useState<PickableAsset | null>(null);
 
   const tabs: { key: AssetTab; label: string }[] = [
@@ -566,34 +641,52 @@ export const RecommendedAssetsSection: React.FC<RecommendedAssetsSectionProps> =
 
   const visibleAssets = useMemo((): PickableAsset[] => {
     const customsForRegion = (region: AssetMarket) =>
-      communityPickables.filter((asset) => asset.marketRegion === region);
+      communityPickables.filter((asset) => {
+        if (asset.marketRegion !== region) return false;
+        if (region === 'Korea' && FOREIGN_PRESET_NAME_KEYS.has(presetNameKey(asset.name))) {
+          return false;
+        }
+        if (region === 'US' && DOMESTIC_PRESET_NAME_KEYS.has(presetNameKey(asset.name))) {
+          return false;
+        }
+        return true;
+      });
 
+    let merged: PickableAsset[];
     if (activeTab === 'domestic') {
-      return mergePickablesByName(
+      merged = mergePickablesByName(
         DOMESTIC_PRESETS.map((preset) =>
           presetToPickable(preset, 'Korea', exchangeRate, marketPrices, catalogPrices)
         ),
         customsForRegion('Korea')
       );
-    }
-    if (activeTab === 'foreign') {
-      return mergePickablesByName(
+    } else if (activeTab === 'foreign') {
+      merged = mergePickablesByName(
         FOREIGN_PRESETS.map((preset) =>
           presetToPickable(preset, 'US', exchangeRate, marketPrices, catalogPrices)
         ),
         customsForRegion('US')
       );
-    }
-    if (activeTab === 'crypto') {
-      return mergePickablesByName(
+    } else if (activeTab === 'crypto') {
+      merged = mergePickablesByName(
         CRYPTO_PRESETS.map((preset) =>
           presetToPickable(preset, 'Crypto', exchangeRate, marketPrices, catalogPrices)
         ),
         customsForRegion('Crypto')
       );
+    } else {
+      merged = communityPickables;
     }
-    return communityPickables;
-  }, [activeTab, communityPickables, exchangeRate, marketPrices, catalogPrices]);
+
+    return sortPickableAssets(merged, sortOrder, exchangeRate, marketPrices, catalogPrices);
+  }, [
+    activeTab,
+    communityPickables,
+    exchangeRate,
+    marketPrices,
+    catalogPrices,
+    sortOrder,
+  ]);
 
   const handleSuccess = (message: string) => {
     onBuySuccess(message);
@@ -628,21 +721,48 @@ export const RecommendedAssetsSection: React.FC<RecommendedAssetsSectionProps> =
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-[1fr_minmax(220px,320px)] gap-2 items-start">
-          <div className="flex flex-wrap gap-1 self-center">
-            {tabs.map((tab) => (
-              <button
-                key={tab.key}
-                type="button"
-                onClick={() => setActiveTab(tab.key)}
-                className={`px-2 py-1 text-[10px] font-bold rounded-md border transition cursor-pointer ${
-                  activeTab === tab.key
-                    ? 'bg-white text-emerald-800 border-emerald-300 shadow-sm'
-                    : 'bg-transparent text-slate-500 border-transparent hover:bg-white/60 hover:text-slate-700'
-                }`}
-              >
-                {tab.label}
-              </button>
-            ))}
+          <div className="flex flex-col gap-1.5 self-center">
+            <div className="flex flex-wrap gap-1">
+              {tabs.map((tab) => (
+                <button
+                  key={tab.key}
+                  type="button"
+                  onClick={() => setActiveTab(tab.key)}
+                  className={`px-2 py-1 text-[10px] font-bold rounded-md border transition cursor-pointer ${
+                    activeTab === tab.key
+                      ? 'bg-white text-emerald-800 border-emerald-300 shadow-sm'
+                      : 'bg-transparent text-slate-500 border-transparent hover:bg-white/60 hover:text-slate-700'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+            {activeTab !== 'custom' && (
+              <div className="flex flex-wrap items-center gap-1">
+                <span className="text-[9px] font-bold text-slate-400 mr-0.5">정렬</span>
+                {(
+                  [
+                    { key: 'name-asc' as const, label: '가나다순' },
+                    { key: 'price-desc' as const, label: '가격 높은순' },
+                    { key: 'price-asc' as const, label: '가격 낮은순' },
+                  ] as const
+                ).map((option) => (
+                  <button
+                    key={option.key}
+                    type="button"
+                    onClick={() => setSortOrder(option.key)}
+                    className={`px-2 py-0.5 text-[9px] font-bold rounded-md border transition cursor-pointer ${
+                      sortOrder === option.key
+                        ? 'bg-slate-800 text-white border-slate-800'
+                        : 'bg-white text-slate-500 border-slate-200 hover:border-slate-300'
+                    }`}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           <AssetSearchAndAdd

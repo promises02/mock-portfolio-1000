@@ -446,14 +446,14 @@ async function startServer() {
       reasoning: 'GLD ETF 설정 시세 $386.54 (1달러당 1,500원 원화 계산 적용).'
     },
     '노키아adr': {
-      currentPrice: 21120,
+      currentPrice: 22200,
       sourceUrl: 'https://finance.naver.com/item/main.naver?code=NOK',
-      reasoning: '노키아 ADR 설정 시세 $14.08 (1달러당 1,500원 원화 계산 적용).'
+      reasoning: '노키아 ADR 설정 시세 $14.80 (1달러당 1,500원 원화 계산 적용).'
     },
     'nokia': {
-      currentPrice: 21120,
+      currentPrice: 22200,
       sourceUrl: 'https://finance.naver.com/item/main.naver?code=NOK',
-      reasoning: '노키아 ADR 설정 시세 $14.08 (1달러당 1,500원 원화 계산 적용).'
+      reasoning: '노키아 ADR 설정 시세 $14.80 (1달러당 1,500원 원화 계산 적용).'
     },
     '록히드마틴': {
       currentPrice: 810495,

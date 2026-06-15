@@ -130,10 +130,14 @@ export const ASSET_PRICE_REGISTRY: AssetPriceConfig[] = [
     aliases: ['synopsys'],
   }),
   entry('TSMC', 'us', 635895, 'https://finance.yahoo.com/quote/TSM', { yahooSymbol: 'TSM' }),
+  entry('테슬라', 'us', 630000, 'https://finance.yahoo.com/quote/TSLA', {
+    yahooSymbol: 'TSLA',
+    aliases: ['tesla'],
+  }),
   entry('VOO', 'us', 1022925, 'https://finance.yahoo.com/quote/VOO', { yahooSymbol: 'VOO' }),
   entry('ASML', 'us', 2795325, 'https://finance.yahoo.com/quote/ASML', { yahooSymbol: 'ASML' }),
   entry('GLD', 'us', 579810, 'https://finance.yahoo.com/quote/GLD', { yahooSymbol: 'GLD' }),
-  entry('노키아 ADR', 'us', 21120, 'https://finance.yahoo.com/quote/NOK', {
+  entry('노키아 ADR', 'us', 22200, 'https://finance.yahoo.com/quote/NOK', {
     yahooSymbol: 'NOK',
     aliases: ['노키아adr', 'nokia'],
   }),

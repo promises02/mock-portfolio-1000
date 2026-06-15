@@ -7,7 +7,7 @@ import {
   Tooltip
 } from 'recharts';
 import { AssetItem } from '../types';
-import { formatCommas, formatKRW, getAssetColor, inferAssetMarket, inferAssetSector, DEFAULT_EXCHANGE_RATE } from '../utils';
+import { formatCommas, formatKRW, getAssetColor, resolveAssetMarketGroup, resolveAssetSector, DEFAULT_EXCHANGE_RATE } from '../utils';
 import { CatalogPriceMap, getCurrentUnitKrw } from '../utils/portfolioPnL';
 
 interface PortfolioChartProps {
@@ -82,7 +82,7 @@ export const PortfolioChart: React.FC<PortfolioChartProps> = ({
       const val = getAssetPrice(asset) * asset.quantity;
       if (val <= 0) return;
 
-      const groupName = asset.marketGroup || inferAssetMarket(asset.name, asset.type || 'stock');
+      const groupName = resolveAssetMarketGroup(asset);
       const key = marketGroups[groupName] ? groupName : '기타';
       marketGroups[key].value += val;
     });
@@ -103,6 +103,7 @@ export const PortfolioChart: React.FC<PortfolioChartProps> = ({
     const sectorGroups: Record<string, { value: number; color: string }> = {
       '반도체': { value: 0, color: '#1E40AF' },
       '정보기술(IT)': { value: 0, color: '#4C1D95' },
+      '자동차': { value: 0, color: '#DC2626' },
       '경기소비재': { value: 0, color: '#DC2626' },
       '금융': { value: 0, color: '#EC4899' },
       '원자재': { value: 0, color: '#EAB308' },
@@ -120,7 +121,7 @@ export const PortfolioChart: React.FC<PortfolioChartProps> = ({
       const val = getAssetPrice(asset) * asset.quantity;
       if (val <= 0) return;
 
-      const groupName = asset.sector || inferAssetSector(asset.name, asset.type || 'stock');
+      const groupName = resolveAssetSector(asset);
       const key = sectorGroups[groupName] ? groupName : '기타';
       sectorGroups[key].value += val;
     });

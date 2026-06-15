@@ -35,6 +35,10 @@ export const DOMESTIC_PRESETS: PresetAsset[] = [
   { name: '삼성전자', type: 'stock', price: 322500 },
   { name: '현대차', type: 'stock', price: 607000 },
   { name: '두산에너빌리티', type: 'stock', price: 106805 },
+  { name: 'LG화학', type: 'stock', price: 358000 },
+  { name: 'NAVER', type: 'stock', price: 212000 },
+  { name: '카카오', type: 'stock', price: 45800 },
+  { name: '셀트리온', type: 'stock', price: 189500 },
   { name: 'TIGER 반도체TOP10', type: 'etf', price: 53000 },
   { name: 'KODEX 미국S&P500', type: 'etf', price: 25420 },
   { name: 'KODEX 미국나스닥100', type: 'etf', price: 29645 },
@@ -55,10 +59,11 @@ export const FOREIGN_PRESETS: PresetAsset[] = [
   { name: 'SCHD', type: 'etf', price: 49230, usdPrice: 32.82 },
   { name: '시놉시스', type: 'stock', price: 680835, usdPrice: 453.89 },
   { name: 'TSMC', type: 'stock', price: 635895, usdPrice: 423.93 },
+  { name: '테슬라', type: 'stock', price: 630000, usdPrice: 420, ticker: 'TSLA' },
   { name: 'VOO', type: 'etf', price: 1022925, usdPrice: 681.95 },
   { name: 'ASML', type: 'stock', price: 2795325, usdPrice: 1863.55 },
   { name: 'GLD', type: 'etf', price: 579810, usdPrice: 386.54 },
-  { name: '노키아 ADR', type: 'stock', price: 21120, usdPrice: 14.08 },
+  { name: '노키아 ADR', type: 'stock', price: 22200, usdPrice: 14.8 },
   { name: '록히드마틴', type: 'stock', price: 810495, usdPrice: 540.33 },
   { name: '루멘텀 홀딩스', type: 'stock', price: 1382340, usdPrice: 921.56 },
   { name: '브룩필드', type: 'stock', price: 67815, usdPrice: 45.21 },
@@ -78,4 +83,41 @@ export const ALL_PRESETS: PresetAsset[] = [
 export function getPresetByName(name: string): PresetAsset | undefined {
   const norm = name.trim().toLowerCase();
   return ALL_PRESETS.find(p => p.name.trim().toLowerCase() === norm);
+}
+
+/** 미국 주식 간편 선택 UI용 영문 표시명 (내부 식별·매수는 한글 canonical name 유지) */
+export const US_ASSET_ENGLISH_NAMES: Readonly<Record<string, string>> = {
+  AMD: 'AMD',
+  '알파벳 Class A': 'Alphabet (Class A)',
+  아마존: 'Amazon',
+  애플: 'Apple',
+  브로드컴: 'Broadcom',
+  메타: 'Meta',
+  마이크로소프트: 'Microsoft',
+  마이크론: 'Micron Technology',
+  엔비디아: 'NVIDIA',
+  팔란티어: 'Palantir',
+  SPY: 'SPY',
+  SCHD: 'SCHD',
+  시놉시스: 'Synopsys',
+  TSMC: 'TSMC',
+  테슬라: 'Tesla',
+  VOO: 'VOO',
+  ASML: 'ASML',
+  GLD: 'GLD',
+  '노키아 ADR': 'Nokia ADR',
+  록히드마틴: 'Lockheed Martin',
+  '루멘텀 홀딩스': 'Lumentum Holdings',
+  브룩필드: 'Brookfield',
+  '스페이스 X': 'SpaceX',
+};
+
+export function getUsAssetDisplayName(name: string): string {
+  const trimmed = name.trim();
+  if (US_ASSET_ENGLISH_NAMES[trimmed]) return US_ASSET_ENGLISH_NAMES[trimmed];
+  const lower = trimmed.toLowerCase();
+  const match = Object.entries(US_ASSET_ENGLISH_NAMES).find(
+    ([key]) => key.toLowerCase() === lower
+  );
+  return match?.[1] ?? trimmed;
 }

@@ -8,7 +8,7 @@ import {
   getDoc,
   getDocFromServer
 } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType, getAllCommunityCustomAssets, fetchRealtimePriceSnapshot, sellAsset, persistPortfolio, subscribeMarketPrices, subscribeGlobalExchangeRate, subscribeCommunityCustomAssets, SHARED_CONFIG_DOC_ID, createPortfolio, updatePortfolioValues, resolveInitialCapital, repairPortfolioIfNeeded, setAdminSessionPassword, clearAdminSessionPassword, getAllTransactions, filterTransactions, calculateTransactionStats, formatTransactionAssetLabel, formatTransactionDateTime, formatTransactionPriceQuantity, exportTransactionsToCsv } from './firebase';
+import { db, handleFirestoreError, OperationType, getAllCommunityCustomAssets, fetchRealtimePriceSnapshot, sellAsset, persistPortfolio, subscribeMarketPrices, subscribeGlobalExchangeRate, subscribeCommunityCustomAssets, SHARED_CONFIG_DOC_ID, createPortfolio, recalculatePortfolioValues, resolveInitialCapital, repairPortfolioIfNeeded, setAdminSessionPassword, clearAdminSessionPassword, getAllTransactions, filterTransactions, calculateTransactionStats, formatTransactionAssetLabel, formatTransactionDateTime, formatTransactionPriceQuantity, exportTransactionsToCsv } from './firebase';
 import { AssetItem, CustomAsset, Portfolio, MarketPriceMap, PortfolioMainTab, TransactionFilterType, TransactionPeriodFilter, TransactionFilterState, Transaction } from './types';
 import { LoginModal } from './components/LoginModal';
 import { AssetInputForm } from './components/AssetInputForm';
@@ -21,8 +21,8 @@ import { RecommendedAssetsSection } from './components/RecommendedAssetsSection'
 import { BudgetSummaryCard } from './components/BudgetSummaryCard';
 import { SellAssetModal } from './components/SellAssetModal';
 import { TransactionDetailModal } from './components/TransactionDetailModal';
-import { formatCommas, formatKRW, inferAssetMarket, inferAssetSector, enrichAssetCurrencyFields, DEFAULT_EXCHANGE_RATE } from './utils';
-import { computeSellPreview, getProfitStyle, computePortfolioProfitSummary, derivePortfolioCash, PORTFOLIO_STARTING_CAPITAL, isUsMarketAsset, buildCatalogPriceMap, getTotalPurchaseAmountKrw, computeBrokeragePortfolioMetrics } from './utils/portfolioPnL';
+import { formatCommas, formatKRW, inferAssetMarket, inferAssetSector, enrichAssetCurrencyFields, DEFAULT_EXCHANGE_RATE, getDisplayPrice } from './utils';
+import { computeSellPreview, getProfitStyle, derivePortfolioCash, PORTFOLIO_STARTING_CAPITAL, isUsMarketAsset, buildCatalogPriceMap, getTotalPurchaseAmountKrw } from './utils/portfolioPnL';
 import { getPresetByName } from './presets';
 import { 
   Coins, 
@@ -208,6 +208,7 @@ export default function App() {
       },
       (error) => {
         handleFirestoreError(error, OperationType.GET, path);
+        setIsLoadingDb(false);
       }
     );
 
@@ -315,19 +316,30 @@ export default function App() {
     return [...allPortfolios]
       .map((portfolio) => {
         const initialCapital = resolveInitialCapital(portfolio);
-        const metrics = computeBrokeragePortfolioMetrics(
-          portfolio.assets || [],
-          portfolio.cumulativeRealizedProfit ?? 0,
-          initialCapital,
+        const metrics = recalculatePortfolioValues(
+          {
+            assets: portfolio.assets || [],
+            savings: portfolio.savings,
+            initialCapital,
+            exchangeRate: effectiveExchangeRate,
+            cumulativeRealizedProfit: portfolio.cumulativeRealizedProfit ?? 0,
+          },
           marketPrices,
-          effectiveExchangeRate,
-          catalogPrices
+          catalogPrices,
+          effectiveExchangeRate
         );
         return {
           ...portfolio,
-          savings: metrics.savings,
+          savings: derivePortfolioCash(
+            portfolio.assets || [],
+            portfolio.cumulativeRealizedProfit ?? 0,
+            undefined,
+            effectiveExchangeRate
+          ),
           totalAssets: metrics.totalAssets,
           totalCurrentValue: metrics.totalCurrentValue,
+          totalUnrealizedProfit: metrics.totalUnrealizedProfit,
+          totalRealizedProfit: metrics.totalRealizedProfit,
           totalProfitAmount: metrics.totalProfitAmount,
           totalProfitRate: metrics.totalProfitRate,
         };
@@ -379,36 +391,27 @@ export default function App() {
 
   const portfolioValues = useMemo(
     () =>
-      updatePortfolioValues(
-        assets,
-        savings,
-        initialCapital,
+      recalculatePortfolioValues(
+        {
+          assets,
+          savings,
+          initialCapital,
+          exchangeRate: effectiveExchangeRate,
+          cumulativeRealizedProfit,
+        },
         marketPrices,
-        effectiveExchangeRate,
-        catalogPrices
+        catalogPrices,
+        effectiveExchangeRate
       ),
-    [assets, savings, initialCapital, marketPrices, effectiveExchangeRate, catalogPrices]
+    [assets, savings, initialCapital, marketPrices, effectiveExchangeRate, catalogPrices, cumulativeRealizedProfit]
   );
 
   const liveAssetEvaluation = portfolioValues.totalCurrentValue;
   const liveTotalAssets = portfolioValues.totalAssets;
   const liveTotalProfitAmount = portfolioValues.totalProfitAmount;
   const liveTotalProfitRate = portfolioValues.totalProfitRate;
-  const unrealizedProfit = portfolioValues.profitAmount;
-  const profitSummary = useMemo(
-    () =>
-      computePortfolioProfitSummary(
-        assets,
-        marketPrices,
-        effectiveExchangeRate,
-        cumulativeRealizedProfit,
-        savings,
-        catalogPrices,
-        initialCapital
-      ),
-    [assets, marketPrices, effectiveExchangeRate, cumulativeRealizedProfit, savings, catalogPrices, initialCapital]
-  );
-  const realizedProfitTotal = profitSummary.realizedProfit;
+  const unrealizedProfit = portfolioValues.totalUnrealizedProfit;
+  const realizedProfitTotal = portfolioValues.totalRealizedProfit;
   const isYieldModified = assets.some(a => {
     const activeCurrentPrice = marketPrices[a.name.trim()] !== undefined
       ? marketPrices[a.name.trim()]
@@ -524,6 +527,14 @@ export default function App() {
   const sellProfitStyle = sellPreview
     ? getProfitStyle(sellPreview.realizedProfit)
     : getProfitStyle(0);
+
+  const sellPurchaseDisplay =
+    selectedSellAsset && sellPreview
+      ? getDisplayPrice(selectedSellAsset, sellPreview.purchaseExchangeRate ?? effectiveExchangeRate, {
+          priceKrw: sellPreview.purchasePriceKrw,
+          priceUsd: sellPreview.purchasePriceUsd,
+        })
+      : '';
 
   // Manual Trigger: Fetch AI actual current prices and calculate yield simulations
   const handleCheckRealPrices = async (targetAssets = assets) => {
@@ -1295,8 +1306,8 @@ export default function App() {
   const renderNavbar = () => (
     <header className="flex items-center justify-between px-6 sm:px-8 py-4 bg-white border-b border-slate-200 shrink-0 sticky top-0 z-40 shadow-sm/5 bg-white/95 backdrop-blur-sm">
       <div className="flex items-center gap-3">
-        <div className="w-10 h-10 bg-emerald-650 rounded-lg flex items-center justify-center text-white font-bold text-xl shadow-inner select-none font-sans">
-          ₩
+        <div className="w-10 h-10 bg-emerald-50 rounded-lg flex items-center justify-center text-xl shadow-sm select-none border border-emerald-100">
+          <span role="img" aria-label="모의 투자">📈</span>
         </div>
         <div>
           <h1 className="text-lg sm:text-xl font-extrabold tracking-tight uppercase text-slate-800">
@@ -1613,18 +1624,9 @@ export default function App() {
                           </div>
 
                           <div className="px-4 py-3 space-y-2 border-b border-slate-100 text-sm">
-                            {isUsMarketAsset(selectedSellAsset) &&
-                            sellPreview.purchasePriceUsd != null &&
-                            sellPreview.purchaseExchangeRate != null ? (
+                            {isUsMarketAsset(selectedSellAsset) ? (
                               <>
-                                <InfoRow
-                                  label="평균 매입가"
-                                  value={`${sellPreview.purchasePriceUsd.toFixed(2)} USD (고정!)`}
-                                />
-                                <InfoRow
-                                  label="매입 환율"
-                                  value={`${formatCommas(sellPreview.purchaseExchangeRate)}원/USD`}
-                                />
+                                <InfoRow label="매수가" value={sellPurchaseDisplay} />
                                 {sellPreview.currentPriceUsd != null && (
                                   <InfoRow
                                     label="현재가"
@@ -1679,9 +1681,7 @@ export default function App() {
                           <div className="px-4 py-3 space-y-2 border-b border-slate-100 text-sm">
                             <InfoRow label="매도금액" value={`${formatCommas(sellPreview.sellAmount)}원`} bold />
                             <InfoRow label="매입금액" value={`${formatCommas(sellPreview.purchaseAmount)}원`} />
-                            {!isUsMarketAsset(selectedSellAsset) && (
-                              <InfoRow label="매수가" value={`${formatCommas(Math.round(sellPreview.purchasePriceKrw))}원`} />
-                            )}
+                            <InfoRow label="매수가" value={sellPurchaseDisplay} />
                           </div>
 
                           <div className="px-4 py-3 space-y-2 border-b border-slate-100 text-sm">
@@ -1784,7 +1784,7 @@ export default function App() {
                 {/* Live Real-time Simulation Yield Summary Panel */}
                 <div
                   className="w-full mt-6 p-4 bg-slate-50 border border-slate-200 rounded-2xl space-y-3 shadow-xs text-xs animate-fade-in text-slate-800"
-                  data-logical-name="totalProfitRateCalculationFix"
+                  data-logical-name="accurateProfitCalculationV2_withExchangeRate"
                 >
                   <div className="flex items-center justify-between pb-2 border-b border-slate-250">
                     <span className="font-extrabold text-slate-700 flex items-center space-x-1.5 uppercase font-mono tracking-wide text-[11px]">

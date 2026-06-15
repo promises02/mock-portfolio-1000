@@ -12,7 +12,7 @@ import {
   getFirestore,
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
-import { ALL_PRESETS, getPresetByName } from './presets';
+import { ALL_PRESETS, FOREIGN_PRESETS, getPresetByName } from './presets';
 import { AssetType, AssetMarket, CustomAsset, DisplayCurrency, Portfolio, ValidationResult, BuyRequest, AssetItem, Transaction, TransactionStats, TransactionPeriodFilter, TransactionListFilters, TransactionMonthlyStat, TransactionDetailRow, BuyAssetError, SellAssetError, SellAssetRequest, SellAssetResult, RealtimePriceQuote, RealtimePriceSnapshot, MarketPriceMap, AdminPriceUpdateReason, AdminExchangeRateUpdateReason, AdminPriceUpdateResult, PurchaseRecord } from './types';
 import { DEFAULT_EXCHANGE_RATE, computeKrwEquivalent, getDefaultDisplayCurrency, inferAssetMarketRegion, enrichAssetCurrencyFields, inferAssetMarket, inferAssetSector, formatCommas } from './utils';
 import {
@@ -28,10 +28,17 @@ import {
   isUsMarketAsset,
   normalizeUsAssetPurchaseBasis,
   portfolioCashNeedsRepair,
+  getTotalPurchaseAmountKrw,
   type CatalogPriceMap,
 } from './utils/portfolioPnL';
 export type { CatalogPriceMap } from './utils/portfolioPnL';
-import { GoogleGenAI } from '@google/genai';
+
+async function getGeminiClient() {
+  const apiKey = import.meta.env.VITE_GOOGLE_GEMINI_API_KEY;
+  if (!apiKey) return null;
+  const { GoogleGenAI } = await import('@google/genai');
+  return new GoogleGenAI({ apiKey });
+}
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
@@ -124,12 +131,6 @@ function parseGeminiJson(text: string): Record<string, unknown> {
   return JSON.parse(cleanText) as Record<string, unknown>;
 }
 
-function getGeminiClient(): GoogleGenAI | null {
-  const apiKey = import.meta.env.VITE_GOOGLE_GEMINI_API_KEY;
-  if (!apiKey) return null;
-  return new GoogleGenAI({ apiKey });
-}
-
 export async function validateAsset(
   assetName: string,
   market: string,
@@ -145,7 +146,7 @@ export async function validateAsset(
     apiError,
   });
 
-  const ai = getGeminiClient();
+  const ai = await getGeminiClient();
   if (!ai) {
     return failResult(true);
   }
@@ -287,6 +288,30 @@ function isSpaceXAsset(name: string): boolean {
   return normalized.includes('스페이스') || normalized.includes('spacex') || normalized.includes('space x');
 }
 
+function isForeignPresetName(name: string): boolean {
+  const key = name.trim().toLowerCase();
+  return FOREIGN_PRESETS.some((preset) => preset.name.trim().toLowerCase() === key);
+}
+
+function applyForeignPresetMarketFields(asset: CustomAsset): void {
+  if (!isForeignPresetName(asset.name)) return;
+
+  const preset = getPresetByName(asset.name);
+  asset.marketRegion = 'US';
+  asset.displayCurrency = 'USD';
+  asset.market = '미국 주식';
+
+  let priceUSD = sanitizeNumeric(asset.priceUSD);
+  if ((!priceUSD || priceUSD <= 0) && preset?.usdPrice != null && preset.usdPrice > 0) {
+    priceUSD = preset.usdPrice;
+    asset.priceUSD = priceUSD;
+  }
+  if (priceUSD && priceUSD > 0) {
+    asset.price = Math.round(priceUSD * DEFAULT_EXCHANGE_RATE);
+    delete asset.priceKRW;
+  }
+}
+
 /** logicalName: assetCardDebugAndCompact — Firestore customAssets NaN/잘못된 가격 보정 */
 export function normalizeCustomAsset(data: CustomAsset, docId: string): CustomAsset {
   const asset: CustomAsset = { ...data, id: docId };
@@ -304,7 +329,13 @@ export function normalizeCustomAsset(data: CustomAsset, docId: string): CustomAs
     if (priceKRW === 160) {
       delete asset.priceKRW;
     }
-  } else if (asset.displayCurrency === 'USD' && priceUSD && priceUSD > 0) {
+  } else {
+    applyForeignPresetMarketFields(asset);
+    priceUSD = sanitizeNumeric(asset.priceUSD);
+    priceKRW = sanitizeNumeric(asset.priceKRW);
+  }
+
+  if (asset.displayCurrency === 'USD' && priceUSD && priceUSD > 0) {
     price = Math.round(priceUSD * DEFAULT_EXCHANGE_RATE);
   } else if (priceKRW && priceKRW > 0) {
     price = Math.round(priceKRW);
@@ -920,6 +951,7 @@ export async function buyAsset(nickname: string, request: BuyRequest): Promise<v
               ...asset,
               quantity: newQty,
               price: newAvgPrice,
+              averagePurchasePrice: newAvgPrice,
               currentPrice: priceKrw,
               totalPurchaseAmount,
               priceKRW: pricePerUnit,
@@ -955,6 +987,7 @@ export async function buyAsset(nickname: string, request: BuyRequest): Promise<v
             type: inferredType,
             price: priceKrw,
             quantity,
+            averagePurchasePrice: priceKrw,
             currentPrice: priceKrw,
             totalPurchaseAmount: amountInKrw,
             market: inferredRegion,
@@ -1172,15 +1205,21 @@ export function buildTransactionDetailRows(
   if (tx.type === 'BUY') {
     if (isUs) {
       const priceUsd = tx.priceUsd ?? tx.price;
-      rows.push({ label: '매수가', value: `${priceUsd.toFixed(2)} USD` });
+      const krwPerShare =
+        rate != null && rate > 0
+          ? Math.round(priceUsd * rate)
+          : qty > 0
+            ? Math.round(amountKrw / qty)
+            : 0;
+      rows.push({
+        label: '매수가',
+        value: `${priceUsd.toFixed(2)} USD · ${formatCommas(krwPerShare)}원`,
+      });
     } else {
       rows.push({ label: '매수가', value: `${formatCommas(Math.round(tx.price))}원` });
     }
     rows.push({ label: '수량', value: `${qty}주` });
     rows.push({ label: '총액', value: `${formatCommas(amountKrw)}원` });
-    if (isUs && rate != null) {
-      rows.push({ label: '환율', value: `${formatCommas(rate)}원/USD` });
-    }
   } else {
     if (isUs) {
       const sellUsd = inferUsSellPriceUsd(tx, rate);
@@ -1575,10 +1614,185 @@ export interface PortfolioValueUpdate {
   totalProfitAmount: number;
   totalProfitRate: number;
   totalPurchaseAmount: number;
+  totalUnrealizedProfit: number;
+  totalRealizedProfit: number;
 }
 
-/** logicalName: realizedProfitWithCashFlowFixed — 미실현·실현 손익 계산 (re-export) */
+/** logicalName: accurateProfitCalculationV2_withExchangeRate — re-export */
 export { calculateUnrealizedProfit, buildCatalogPriceMap } from './utils/portfolioPnL';
+
+export function resolveAveragePurchasePrice(asset: AssetItem): number {
+  const market = asset.market ?? inferAssetMarketRegion(asset.name, asset.type || 'stock');
+  if (market === 'US') {
+    return getPurchasePriceUsd(asset, asset.purchaseExchangeRate ?? DEFAULT_EXCHANGE_RATE);
+  }
+  return asset.averagePurchasePrice ?? asset.price;
+}
+
+export function resolveAssetDisplayName(asset: AssetItem): string {
+  return asset.assetName?.trim() || asset.name.trim();
+}
+
+/** logicalName: accurateProfitCalculationV2_withExchangeRate — 자산별 미실현 손익 */
+export function calculateAssetUnrealizedProfit(
+  asset: AssetItem,
+  currentExchangeRate: number,
+  marketPrices?: MarketPriceMap,
+  catalogPrices?: CatalogPriceMap
+): { profit: number; profitRate: number; currentAmount: number; purchaseAmount: number } {
+  const result = calculateUnrealizedProfit(
+    asset,
+    marketPrices,
+    currentExchangeRate,
+    catalogPrices
+  );
+  return {
+    profit: result.unrealizedProfit,
+    profitRate: result.unrealizedProfitRate,
+    currentAmount: result.currentAmount,
+    purchaseAmount: result.purchaseAmount,
+  };
+}
+
+/** purchaseHistory SELL 기록에서 실현손익 합산 */
+export function sumRealizedProfitFromAssets(assets: AssetItem[]): number {
+  return assets.reduce((total, asset) => {
+    const sells = (asset.purchaseHistory ?? []).filter(
+      (record) => record.type === 'SELL' && record.realizedProfit != null
+    );
+    return total + sells.reduce((sum, record) => sum + (record.realizedProfit ?? 0), 0);
+  }, 0);
+}
+
+/** logicalName: accurateProfitCalculationV2_withExchangeRate — 평균매입가 재계산 (매수) */
+export function applyBuyToAsset(
+  asset: AssetItem,
+  quantity: number,
+  price: number,
+  currentExchangeRate: number
+): AssetItem {
+  const market = asset.market ?? inferAssetMarketRegion(asset.name, asset.type || 'stock');
+  const existingQty = asset.quantity || 0;
+  const totalQty = existingQty + quantity;
+
+  if (market === 'US') {
+    const purchaseExchangeRate =
+      existingQty === 0 ? currentExchangeRate : resolvePurchaseExchangeRate(asset, currentExchangeRate);
+    const existingUsd = resolveAveragePurchasePrice(asset);
+    const newAvgUsd =
+      existingQty === 0
+        ? price
+        : (existingUsd * existingQty + price * quantity) / totalQty;
+    const priceKrw = Math.round(newAvgUsd * purchaseExchangeRate);
+
+    return {
+      ...asset,
+      quantity: totalQty,
+      averagePurchasePrice: newAvgUsd,
+      purchasePriceUSD: newAvgUsd,
+      priceUSD: price,
+      price: priceKrw,
+      purchaseExchangeRate,
+      totalPurchaseAmount: Math.round(priceKrw * totalQty),
+    };
+  }
+
+  const existingPrice = asset.averagePurchasePrice ?? asset.price;
+  const newAvg =
+    existingQty === 0
+      ? price
+      : (existingPrice * existingQty + price * quantity) / totalQty;
+
+  return {
+    ...asset,
+    quantity: totalQty,
+    averagePurchasePrice: newAvg,
+    price: Math.round(newAvg),
+    priceKRW: Math.round(newAvg),
+    purchaseExchangeRate: 1,
+    totalPurchaseAmount: Math.round(newAvg * totalQty),
+  };
+}
+
+/** logicalName: accurateProfitCalculationV2_withExchangeRate — 실현손익 (매도) */
+export function applySellToAsset(
+  asset: AssetItem,
+  quantity: number,
+  price: number,
+  currentExchangeRate: number
+): { asset: AssetItem; realizedProfit: number; realizedProfitRate: number; sellAmountKrw: number } {
+  const heldQty = asset.quantity || 0;
+  if (quantity > heldQty) {
+    throw new SellAssetError(
+      `${resolveAssetDisplayName(asset)}: 보유량(${heldQty})이 매도량(${quantity})보다 적습니다.`
+    );
+  }
+
+  const market = asset.market ?? inferAssetMarketRegion(asset.name, asset.type || 'stock');
+  const purchaseUnitKrw = getPurchaseUnitKrw(asset, currentExchangeRate);
+  const sellUnitKrw =
+    market === 'US' ? Math.round(price * currentExchangeRate) : Math.round(price);
+  const realizedProfit = Math.round((sellUnitKrw - purchaseUnitKrw) * quantity);
+  const realizedProfitRate =
+    purchaseUnitKrw > 0 ? ((sellUnitKrw - purchaseUnitKrw) / purchaseUnitKrw) * 100 : 0;
+  const sellAmountKrw = Math.round(sellUnitKrw * quantity);
+
+  return {
+    asset: {
+      ...asset,
+      quantity: heldQty - quantity,
+    },
+    realizedProfit,
+    realizedProfitRate,
+    sellAmountKrw,
+  };
+}
+
+/** logicalName: accurateProfitCalculationV2_withExchangeRate — 포트폴리오 전체 손익 재계산 */
+export function recalculatePortfolioValues(
+  portfolio: Pick<
+    Portfolio,
+    'assets' | 'savings' | 'initialCapital' | 'exchangeRate' | 'cumulativeRealizedProfit'
+  >,
+  marketPrices?: MarketPriceMap,
+  catalogPrices?: CatalogPriceMap,
+  newExchangeRate?: number
+): PortfolioValueUpdate {
+  const currentExchangeRate = newExchangeRate ?? portfolio.exchangeRate ?? DEFAULT_EXCHANGE_RATE;
+  const initialCapital = resolveInitialCapital(portfolio as Portfolio);
+  const savings =
+    portfolio.savings ??
+    derivePortfolioCash(
+      portfolio.assets ?? [],
+      portfolio.cumulativeRealizedProfit ?? 0,
+      undefined,
+      currentExchangeRate
+    );
+
+  const totalRealizedProfit =
+    portfolio.cumulativeRealizedProfit ?? sumRealizedProfitFromAssets(portfolio.assets ?? []);
+
+  const base = updatePortfolioValues(
+    portfolio.assets ?? [],
+    savings,
+    initialCapital,
+    marketPrices,
+    currentExchangeRate,
+    catalogPrices
+  );
+
+  const totalProfitAmount = Math.round(totalRealizedProfit + base.profitAmount);
+  const totalProfitRate =
+    initialCapital > 0 ? (totalProfitAmount / initialCapital) * 100 : 0;
+
+  return {
+    ...base,
+    totalUnrealizedProfit: base.profitAmount,
+    totalRealizedProfit,
+    totalProfitAmount,
+    totalProfitRate,
+  };
+}
 
 export interface RealizedProfitOnSell {
   sellAmount: number;
@@ -1604,14 +1818,14 @@ export function computeRealizedProfitOnSell(
   const qty = Math.max(0, Math.floor(sellQuantity));
 
   if (market === 'US') {
-    const purchaseUsd = getPurchasePriceUsd(asset, exchangeRate);
-    const purchaseRate = resolvePurchaseExchangeRate(asset, exchangeRate);
-    const sellPriceUsd = exchangeRate > 0 ? sellPriceKrw / exchangeRate : 0;
-    const purchasePriceKrw = Math.round(purchaseUsd * purchaseRate);
+    const purchasePriceKrw = getPurchaseUnitKrw(asset, exchangeRate);
     const sellAmount = Math.round(sellPriceKrw * qty);
-    const purchaseAmount = Math.round(purchaseUsd * purchaseRate * qty);
+    const purchaseAmount = Math.round(purchasePriceKrw * qty);
     const realizedProfit = sellAmount - purchaseAmount;
     const profitRate = purchaseAmount > 0 ? (realizedProfit / purchaseAmount) * 100 : 0;
+    const purchaseUsd = getPurchasePriceUsd(asset, exchangeRate);
+    const purchaseRate = resolvePurchaseExchangeRate(asset, exchangeRate);
+    const sellPriceUsd = exchangeRate > 0 ? sellPriceKrw / exchangeRate : undefined;
 
     return {
       sellAmount,
@@ -1647,7 +1861,7 @@ export function computeRealizedProfitOnSell(
   };
 }
 
-/** logicalName: totalProfitRateCalculationFix — 포트폴리오 평가·손익 일괄 계산 */
+/** logicalName: accurateProfitCalculationV2_withExchangeRate — 포트폴리오 평가·손익 일괄 계산 */
 export function updatePortfolioValues(
   assets: AssetItem[],
   savings: number,
@@ -1665,7 +1879,12 @@ export function updatePortfolioValues(
   );
 
   const updatedAssets = normalizedAssets.map((asset) => {
-    const profitInfo = calculateUnrealizedProfit(asset, marketPrices, exchangeRate, catalogPrices);
+    const profitInfo = calculateUnrealizedProfit(
+      asset,
+      marketPrices,
+      exchangeRate,
+      catalogPrices
+    );
     totalCurrentValue += profitInfo.currentAmount;
     totalUnrealizedProfit += profitInfo.unrealizedProfit;
     totalPurchaseAmountKRW += profitInfo.purchaseAmount;
@@ -1681,8 +1900,7 @@ export function updatePortfolioValues(
   const roundedEvaluation = Math.round(totalCurrentValue);
   const roundedSavings = Math.round(savings);
   const totalAssets = roundedSavings + roundedEvaluation;
-  const totalProfitAmount = totalAssets - initialCapital;
-  const totalProfitRate = initialCapital > 0 ? (totalProfitAmount / initialCapital) * 100 : 0;
+  const totalProfitAmountFromNav = totalAssets - initialCapital;
   const profitRate =
     totalPurchaseAmountKRW > 0 ? (totalUnrealizedProfit / totalPurchaseAmountKRW) * 100 : 0;
 
@@ -1692,9 +1910,12 @@ export function updatePortfolioValues(
     profitAmount: Math.round(totalUnrealizedProfit),
     profitRate,
     totalAssets,
-    totalProfitAmount,
-    totalProfitRate,
+    totalProfitAmount: totalProfitAmountFromNav,
+    totalProfitRate:
+      initialCapital > 0 ? (totalProfitAmountFromNav / initialCapital) * 100 : 0,
     totalPurchaseAmount: Math.round(totalPurchaseAmountKRW),
+    totalUnrealizedProfit: Math.round(totalUnrealizedProfit),
+    totalRealizedProfit: 0,
   };
 }
 
@@ -2377,7 +2598,7 @@ async function parseAdminApiResponse(
       return {
         success: false,
         message: data.message || '저장 중 오류가 발생했습니다.',
-        shouldFallback: response.status === 404,
+        shouldFallback: response.status === 404 || response.status === 503,
       };
     }
     return data;
@@ -2388,6 +2609,37 @@ async function parseAdminApiResponse(
       shouldFallback: true,
     };
   }
+}
+
+async function tryClientFirestoreWrite(
+  label: string,
+  operation: () => Promise<void>
+): Promise<boolean> {
+  try {
+    await operation();
+    return true;
+  } catch (error) {
+    console.warn(`[updateAdminAssetPriceDirect] ${label} failed:`, error);
+    return false;
+  }
+}
+
+function firestorePermissionHelpMessage(): string {
+  return (
+    'Firestore 저장 권한이 없습니다.\n\n' +
+    '① Firebase Console → Firestore → 규칙에서 아래를 배포하거나\n' +
+    '   npx firebase-tools login && npx firebase-tools deploy --only firestore:rules\n\n' +
+    '② 또는 Vercel 환경변수 FIREBASE_SERVICE_ACCOUNT에 서비스 계정 JSON을 추가한 뒤 재배포'
+  );
+}
+
+function isFirestorePermissionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes('Missing or insufficient permissions') ||
+    message.includes('PERMISSION_DENIED') ||
+    message.toLowerCase().includes('permission')
+  );
 }
 
 async function writeSharedMarketPriceClient(assetName: string, priceKrw: number): Promise<void> {
@@ -2467,8 +2719,25 @@ async function updateAdminAssetPriceDirect(
   }
 
   const priceKrw = payload.price!;
+  const trimmedName = existing.name.trim();
 
-  await writeSharedMarketPriceClient(existing.name, priceKrw);
+  const customPricesOk = await tryClientFirestoreWrite('customPrices', () =>
+    setDoc(
+      doc(db, 'customPrices', trimmedName),
+      {
+        price: priceKrw,
+        updatedAt: now,
+        source: 'admin_override',
+        lastUpdatedBy: 'admin',
+        updateReason: reason,
+      },
+      { merge: true }
+    )
+  );
+
+  const sharedConfigOk = await tryClientFirestoreWrite('sharedConfig', () =>
+    writeSharedMarketPriceClient(trimmedName, priceKrw)
+  );
 
   const baseFields: Partial<CustomAsset> = snap.exists()
     ? {}
@@ -2483,23 +2752,17 @@ async function updateAdminAssetPriceDirect(
         addedAt: now,
       });
 
-  await setDoc(
-    doc(db, 'customAssets', docId),
-    stripUndefinedDeep({ ...baseFields, ...payload }),
-    { merge: true }
+  await tryClientFirestoreWrite('customAssets', () =>
+    setDoc(
+      doc(db, 'customAssets', docId),
+      stripUndefinedDeep({ ...baseFields, ...payload }),
+      { merge: true }
+    )
   );
 
-  await setDoc(
-    doc(db, 'customPrices', existing.name.trim()),
-    {
-      price: priceKrw,
-      updatedAt: now,
-      source: 'admin_override',
-      lastUpdatedBy: 'admin',
-      updateReason: reason,
-    },
-    { merge: true }
-  );
+  if (!customPricesOk && !sharedConfigOk) {
+    return { success: false, message: firestorePermissionHelpMessage() };
+  }
 
   const formattedPrice =
     displayCurrency === 'USD'
@@ -2720,9 +2983,13 @@ export async function updateAdminAssetPrice(
       return await updateAdminAssetPriceDirect(asset, newPrice, reason);
     } catch (directError) {
       console.error('[updateAdminAssetPrice] direct write failed:', directError);
+      const directMessage =
+        directError instanceof Error ? directError.message : '저장 중 오류가 발생했습니다.';
       return {
         success: false,
-        message: error instanceof Error ? error.message : '저장 중 오류가 발생했습니다.',
+        message: isFirestorePermissionError(directError)
+          ? firestorePermissionHelpMessage()
+          : directMessage,
       };
     }
   }
@@ -2801,4 +3068,1035 @@ export async function syncRealtimeQuotesToCustomPrices(
   console.warn(
     '[syncRealtimeQuotesToCustomPrices] skipped — 시세는 관리자 모드에서만 변경됩니다.'
   );
+}
+
+/** logicalName: initialPortfolioDataV1_2026-05-29 — 모의투자 1회차 초기 포트폴리오 시드 */
+export const INITIAL_PORTFOLIO_SEED_LOGICAL_NAME = 'initialPortfolioDataV1_2026-05-29';
+
+const INITIAL_SEED_EXCHANGE_RATE = 1500;
+const INITIAL_SEED_DATE = '2026-05-29';
+const INITIAL_SEED_TIMESTAMP = new Date('2026-05-29T00:00:00+09:00');
+
+const SEED_ASSET_NAME_ALIASES: Record<string, string> = {
+  알파벳: '알파벳 Class A',
+  하이닉스: 'SK하이닉스',
+  MS: '마이크로소프트',
+};
+
+interface InitialSeedBuyLine {
+  label: string;
+  priceKrwPerShare: number;
+  quantity: number;
+}
+
+interface InitialSeedPortfolioConfig {
+  nickname: string;
+  savings: number;
+  buys: InitialSeedBuyLine[];
+}
+
+const INITIAL_PORTFOLIO_SEED_DATA: InitialSeedPortfolioConfig[] = [
+  {
+    nickname: '한영준',
+    savings: 318_040,
+    buys: [
+      { label: '알파벳', priceKrwPerShare: 570_510, quantity: 10 },
+      { label: '시놉시스', priceKrwPerShare: 713_430, quantity: 2 },
+      { label: '루멘텀 홀딩스', priceKrwPerShare: 1_275_000, quantity: 2 },
+    ],
+  },
+  {
+    nickname: '김민정',
+    savings: 463_800,
+    buys: [
+      { label: '알파벳', priceKrwPerShare: 570_510, quantity: 3 },
+      { label: '애플', priceKrwPerShare: 468_090, quantity: 2 },
+      { label: '하이닉스', priceKrwPerShare: 2_350_000, quantity: 1 },
+      { label: '마이크론', priceKrwPerShare: 1_456_500, quantity: 2 },
+      { label: '엔비디아', priceKrwPerShare: 316_710, quantity: 3 },
+      { label: 'MS', priceKrwPerShare: 675_360, quantity: 1 },
+    ],
+  },
+  {
+    nickname: '이준성',
+    savings: 277_310,
+    buys: [
+      { label: '록히드마틴', priceKrwPerShare: 796_755, quantity: 5 },
+      { label: 'TSMC', priceKrwPerShare: 627_675, quantity: 5 },
+      { label: '알파벳', priceKrwPerShare: 570_510, quantity: 4 },
+      { label: '삼성전자', priceKrwPerShare: 318_500, quantity: 1 },
+    ],
+  },
+  {
+    nickname: '이현우',
+    savings: 584_260,
+    buys: [
+      { label: '마이크론', priceKrwPerShare: 1_456_500, quantity: 4 },
+      { label: '테슬라', priceKrwPerShare: 653_685, quantity: 4 },
+      { label: 'SCHD', priceKrwPerShare: 48_750, quantity: 20 },
+    ],
+  },
+];
+
+function resolveSeedAssetName(label: string): string {
+  return SEED_ASSET_NAME_ALIASES[label.trim()] ?? label.trim();
+}
+
+function resolveSeedAssetDocId(resolvedName: string): string {
+  const preset = getPresetByName(resolvedName);
+  if (preset) {
+    return `${PRESET_ASSET_ID_PREFIX}${sanitizeDocId(preset.name)}`;
+  }
+  return sanitizeDocId(resolvedName);
+}
+
+function seedUsdFromKrw(priceKrwPerShare: number): number {
+  return Math.round((priceKrwPerShare / INITIAL_SEED_EXCHANGE_RATE) * 100) / 100;
+}
+
+function createInitialSeedPurchaseRecord(options: {
+  assetDocId: string;
+  quantity: number;
+  pricePerUnit: number;
+  amountInKrw: number;
+  isUsBuy: boolean;
+}): PurchaseRecord {
+  const { assetDocId, quantity, pricePerUnit, amountInKrw, isUsBuy } = options;
+  return {
+    id: `initial_20260529_buy_${sanitizeDocId(assetDocId)}`,
+    type: 'BUY',
+    quantity,
+    price: pricePerUnit,
+    amount: isUsBuy ? pricePerUnit : amountInKrw,
+    exchangeRateAtTransaction: isUsBuy ? INITIAL_SEED_EXCHANGE_RATE : undefined,
+    amountInKRW: amountInKrw,
+    timestamp: INITIAL_SEED_TIMESTAMP,
+    date: INITIAL_SEED_DATE,
+  };
+}
+
+function buildInitialSeedAssetItem(buy: InitialSeedBuyLine): AssetItem {
+  const name = resolveSeedAssetName(buy.label);
+  const preset = getPresetByName(name);
+  const type = (preset?.type ?? 'stock') as AssetType;
+  const region = inferAssetMarketRegion(name, type);
+  const isUsBuy = region === 'US';
+  const amountInKrw = buy.priceKrwPerShare * buy.quantity;
+  const assetDocId = resolveSeedAssetDocId(name);
+
+  if (isUsBuy) {
+    const priceUsd = seedUsdFromKrw(buy.priceKrwPerShare);
+    const buyRecord = createInitialSeedPurchaseRecord({
+      assetDocId,
+      quantity: buy.quantity,
+      pricePerUnit: priceUsd,
+      amountInKrw,
+      isUsBuy: true,
+    });
+    const usFields = buildUsAssetOnFirstBuy(
+      buy.priceKrwPerShare,
+      priceUsd,
+      INITIAL_SEED_EXCHANGE_RATE,
+      buy.quantity
+    );
+    return stripUndefinedDeep({
+      name,
+      type,
+      quantity: buy.quantity,
+      market: 'US' as AssetMarket,
+      displayCurrency: 'USD' as DisplayCurrency,
+      marketGroup: inferAssetMarket(name, type),
+      sector: inferAssetSector(name, type),
+      purchaseHistory: [buyRecord],
+      ...usFields,
+    });
+  }
+
+  const buyRecord = createInitialSeedPurchaseRecord({
+    assetDocId,
+    quantity: buy.quantity,
+    pricePerUnit: buy.priceKrwPerShare,
+    amountInKrw,
+    isUsBuy: false,
+  });
+
+  return stripUndefinedDeep(
+    enrichAssetCurrencyFields(
+      {
+        name,
+        type,
+        price: buy.priceKrwPerShare,
+        quantity: buy.quantity,
+        currentPrice: buy.priceKrwPerShare,
+        totalPurchaseAmount: amountInKrw,
+        market: region,
+        displayCurrency: 'KRW' as DisplayCurrency,
+        priceKRW: buy.priceKrwPerShare,
+        marketGroup: inferAssetMarket(name, type),
+        sector: inferAssetSector(name, type),
+        purchaseHistory: [buyRecord],
+      },
+      INITIAL_SEED_EXCHANGE_RATE
+    )
+  );
+}
+
+function buildInitialSeedTransaction(
+  buy: InitialSeedBuyLine,
+  assetItem: AssetItem
+): Transaction {
+  const name = resolveSeedAssetName(buy.label);
+  const preset = getPresetByName(name);
+  const region = inferAssetMarketRegion(name, preset?.type ?? 'stock');
+  const isUsBuy = region === 'US';
+  const amountInKrw = buy.priceKrwPerShare * buy.quantity;
+  const assetDocId = resolveSeedAssetDocId(name);
+  const buyRecord = assetItem.purchaseHistory?.[0];
+
+  return stripUndefinedDeep({
+    id: buyRecord?.id ?? `initial_20260529_tx_${sanitizeDocId(assetDocId)}`,
+    assetName: name,
+    type: 'BUY',
+    quantity: buy.quantity,
+    price: isUsBuy ? seedUsdFromKrw(buy.priceKrwPerShare) : buy.priceKrwPerShare,
+    totalAmount: amountInKrw,
+    ...(preset?.ticker ? { ticker: preset.ticker } : {}),
+    ...(isUsBuy
+      ? {
+          priceUsd: seedUsdFromKrw(buy.priceKrwPerShare),
+          exchangeRateAtPurchase: INITIAL_SEED_EXCHANGE_RATE,
+          amountInKRW: amountInKrw,
+        }
+      : {}),
+    transactionDate: INITIAL_SEED_DATE,
+    timestamp: INITIAL_SEED_TIMESTAMP,
+  });
+}
+
+async function upsertInitialSeedCustomAsset(
+  buy: InitialSeedBuyLine
+): Promise<void> {
+  const name = resolveSeedAssetName(buy.label);
+  const preset = getPresetByName(name);
+  const type = (preset?.type ?? 'stock') as CustomAsset['type'];
+  const region: AssetMarket = isForeignPresetName(name)
+    ? 'US'
+    : inferAssetMarketRegion(name, type);
+  const displayCurrency = getDefaultDisplayCurrency(region);
+  const docId = resolveSeedAssetDocId(name);
+  const priceUsd = displayCurrency === 'USD' ? seedUsdFromKrw(buy.priceKrwPerShare) : undefined;
+
+  await setDoc(
+    doc(db, 'customAssets', docId),
+    stripUndefinedDeep({
+      id: docId,
+      name,
+      type,
+      price: buy.priceKrwPerShare,
+      ...(priceUsd != null ? { priceUSD: priceUsd } : {}),
+      ...(displayCurrency === 'KRW' ? { priceKRW: buy.priceKrwPerShare } : {}),
+      ...(preset?.ticker ? { ticker: preset.ticker } : {}),
+      marketRegion: region,
+      displayCurrency,
+      market:
+        region === 'Korea' ? '국내 주식' : region === 'US' ? '미국 주식' : '암호화폐',
+      addedBy: 'system',
+      addedAt: INITIAL_SEED_TIMESTAMP,
+      priceSource: 'admin',
+      lastUpdatedBy: 'admin',
+      lastUpdatedAt: INITIAL_SEED_TIMESTAMP,
+      updateReason: '데이터 정정',
+    }),
+    { merge: true }
+  );
+}
+
+async function seedSingleInitialPortfolio(
+  config: InitialSeedPortfolioConfig
+): Promise<void> {
+  const initialCapital = PORTFOLIO_STARTING_CAPITAL;
+  const assets = config.buys.map((buy) => buildInitialSeedAssetItem(buy));
+  const transactions = config.buys.map((buy, index) =>
+    buildInitialSeedTransaction(buy, assets[index])
+  );
+  const catalogPrices = buildCatalogPriceMap([], INITIAL_SEED_EXCHANGE_RATE);
+  const buyTotalKrw = config.buys.reduce(
+    (sum, buy) => sum + buy.priceKrwPerShare * buy.quantity,
+    0
+  );
+  const portfolioValues = updatePortfolioValues(
+    assets,
+    config.savings,
+    initialCapital,
+    {},
+    INITIAL_SEED_EXCHANGE_RATE,
+    catalogPrices
+  );
+
+  await setDoc(
+    doc(db, 'portfolios', config.nickname),
+    stripUndefinedDeep({
+      nickname: config.nickname,
+      assets: portfolioValues.assets,
+      savings: config.savings,
+      exchangeRate: INITIAL_SEED_EXCHANGE_RATE,
+      lastExchangeRateUpdate: INITIAL_SEED_TIMESTAMP,
+      initialCapital,
+      totalCurrentValue: buyTotalKrw,
+      profitAmount: 0,
+      profitRate: 0,
+      totalAssets: config.savings + buyTotalKrw,
+      totalProfitAmount: 0,
+      totalProfitRate: 0,
+      totalPurchaseAmount: buyTotalKrw,
+      cumulativeRealizedProfit: 0,
+      totalBudget: initialCapital,
+      hasRealPrices: false,
+      transactions,
+      updatedAt: INITIAL_SEED_TIMESTAMP,
+      reason: INITIAL_PORTFOLIO_SEED_LOGICAL_NAME,
+    })
+  );
+}
+
+/** logicalName: initialPortfolioDataV1_2026-05-29 — 4명 초기 포트폴리오 + customAssets 일괄 입력 */
+export async function seedInitialPortfolios20260529(): Promise<{
+  success: boolean;
+  message: string;
+  logicalName: string;
+  seededNicknames: string[];
+}> {
+  const seededNicknames: string[] = [];
+  const seenCustomAssets = new Set<string>();
+
+  try {
+    for (const config of INITIAL_PORTFOLIO_SEED_DATA) {
+      await seedSingleInitialPortfolio(config);
+      seededNicknames.push(config.nickname);
+
+      for (const buy of config.buys) {
+        const name = resolveSeedAssetName(buy.label);
+        if (seenCustomAssets.has(name)) continue;
+        seenCustomAssets.add(name);
+        await upsertInitialSeedCustomAsset(buy);
+      }
+    }
+
+    await setDoc(
+      sharedConfigRef(),
+      stripUndefinedDeep({
+        nickname: SHARED_CONFIG_DOC_ID,
+        assets: [],
+        savings: 0,
+        totalCurrentValue: 0,
+        profitRate: 0,
+        profitAmount: 0,
+        hasRealPrices: false,
+        exchangeRate: INITIAL_SEED_EXCHANGE_RATE,
+        updatedAt: INITIAL_SEED_TIMESTAMP,
+      }),
+      { merge: true }
+    );
+
+    await setDoc(
+      globalSettingsRef(),
+      stripUndefinedDeep({
+        exchangeRate: INITIAL_SEED_EXCHANGE_RATE,
+        updatedAt: INITIAL_SEED_TIMESTAMP,
+      }),
+      { merge: true }
+    );
+
+    return {
+      success: true,
+      logicalName: INITIAL_PORTFOLIO_SEED_LOGICAL_NAME,
+      seededNicknames,
+      message: `✅ 초기 포트폴리오 ${seededNicknames.length}명 입력 완료 (${seededNicknames.join(', ')})`,
+    };
+  } catch (error) {
+    console.error(`[${INITIAL_PORTFOLIO_SEED_LOGICAL_NAME}] failed:`, error);
+    return {
+      success: false,
+      logicalName: INITIAL_PORTFOLIO_SEED_LOGICAL_NAME,
+      seededNicknames,
+      message: error instanceof Error ? error.message : '초기 포트폴리오 입력 중 오류가 발생했습니다.',
+    };
+  }
+}
+
+/** logicalName: initialPortfolioDataV1_2026-05-29 — 5/29 기준 종목별 매수가 (KRW/주) */
+export const REFERENCE_PURCHASE_PRICES_KRW_20260529: Record<string, number> = {
+  'SK하이닉스': 2_350_000,
+  삼성전자: 318_500,
+  현대차: 733_000,
+  두산에너빌리티: 106_805,
+  'TIGER 반도체TOP10': 50_450,
+  'KODEX 미국S&P500': 25_800,
+  'KODEX 미국나스닥100': 30_250,
+  AMD: 774_150,
+  '알파벳 Class A': 570_510,
+  아마존: 405_960,
+  애플: 468_090,
+  브로드컴: 670_155,
+  메타: 948_765,
+  마이크로소프트: 675_360,
+  마이크론: 1_456_500,
+  엔비디아: 316_710,
+  팔란티어: 234_810,
+  SPY: 1_134_720,
+  SCHD: 48_750,
+  시놉시스: 713_430,
+  TSMC: 627_675,
+  VOO: 1_043_235,
+  ASML: 2_419_500,
+  GLD: 625_215,
+  '노키아 ADR': 22_380,
+  록히드마틴: 796_755,
+  '루멘텀 홀딩스': 1_275_000,
+  브룩필드: 68_385,
+};
+
+function lookupReferencePurchasePriceKrw(assetName: string): number | undefined {
+  const canonical = resolveSeedAssetName(assetName);
+  return (
+    REFERENCE_PURCHASE_PRICES_KRW_20260529[canonical] ??
+    REFERENCE_PURCHASE_PRICES_KRW_20260529[assetName.trim()]
+  );
+}
+
+function applyReferencePriceToAssetItem(
+  asset: AssetItem,
+  exchangeRate: number = INITIAL_SEED_EXCHANGE_RATE
+): AssetItem {
+  const canonicalName = resolveSeedAssetName(asset.name);
+  const refKrw = lookupReferencePurchasePriceKrw(asset.name);
+  if (refKrw == null) {
+    return stripUndefinedDeep({ ...asset, name: canonicalName });
+  }
+
+  const preset = getPresetByName(canonicalName);
+  const type = (asset.type ?? preset?.type ?? 'stock') as AssetType;
+  const region = inferAssetMarketRegion(canonicalName, type);
+  const quantity = asset.quantity;
+  const amountInKrw = refKrw * quantity;
+  const assetDocId = resolveSeedAssetDocId(canonicalName);
+  const currentPrice = asset.currentPrice ?? refKrw;
+
+  if (region === 'US') {
+    const priceUsd = seedUsdFromKrw(refKrw);
+    const usFields = buildUsAssetOnFirstBuy(refKrw, priceUsd, exchangeRate, quantity);
+    const buyRecord = createInitialSeedPurchaseRecord({
+      assetDocId,
+      quantity,
+      pricePerUnit: priceUsd,
+      amountInKrw,
+      isUsBuy: true,
+    });
+    return stripUndefinedDeep({
+      ...asset,
+      name: canonicalName,
+      type,
+      quantity,
+      market: 'US' as AssetMarket,
+      displayCurrency: 'USD' as DisplayCurrency,
+      marketGroup: inferAssetMarket(canonicalName, type),
+      sector: inferAssetSector(canonicalName, type),
+      currentPrice,
+      purchaseHistory: [buyRecord],
+      ...usFields,
+    });
+  }
+
+  const buyRecord = createInitialSeedPurchaseRecord({
+    assetDocId,
+    quantity,
+    pricePerUnit: refKrw,
+    amountInKrw,
+    isUsBuy: false,
+  });
+
+  return stripUndefinedDeep(
+    enrichAssetCurrencyFields(
+      {
+        ...asset,
+        name: canonicalName,
+        type,
+        price: refKrw,
+        quantity,
+        currentPrice,
+        totalPurchaseAmount: amountInKrw,
+        market: region,
+        displayCurrency: 'KRW' as DisplayCurrency,
+        priceKRW: refKrw,
+        marketGroup: inferAssetMarket(canonicalName, type),
+        sector: inferAssetSector(canonicalName, type),
+        purchaseHistory: [buyRecord],
+      },
+      exchangeRate
+    )
+  );
+}
+
+function rebuild529TransactionsFromAssets(assets: AssetItem[]): Transaction[] {
+  return assets.map((asset) => buildInitialSeedTransaction(
+    {
+      label: asset.name,
+      priceKrwPerShare: lookupReferencePurchasePriceKrw(asset.name) ?? asset.price,
+      quantity: asset.quantity,
+    },
+    asset
+  ));
+}
+
+/** logicalName: initialPortfolioDataV1_2026-05-29 — 기존 포트폴리오에 5/29 매수가·USD 메타 반영 */
+export async function apply529ReferencePricesToPortfolios(
+  nicknames: string[]
+): Promise<{ success: boolean; message: string; updated: string[] }> {
+  const updated: string[] = [];
+
+  try {
+    for (const nickname of nicknames) {
+      const trimmed = nickname.trim();
+      if (!trimmed) continue;
+
+      const snap = await getDoc(doc(db, 'portfolios', trimmed));
+      if (!snap.exists()) continue;
+
+      const portfolio = { nickname: trimmed, ...snap.data() } as Portfolio;
+      const exchangeRate = portfolio.exchangeRate ?? INITIAL_SEED_EXCHANGE_RATE;
+      const assets = (portfolio.assets ?? []).map((asset) =>
+        applyReferencePriceToAssetItem(asset, exchangeRate)
+      );
+      const buyTotalKrw = assets.reduce(
+        (sum, asset) => sum + getTotalPurchaseAmountKrw(asset, exchangeRate),
+        0
+      );
+      const savings = portfolio.savings ?? Math.max(0, PORTFOLIO_STARTING_CAPITAL - buyTotalKrw);
+      const initialCapital = resolveInitialCapital(portfolio);
+      const portfolioValues = updatePortfolioValues(
+        assets,
+        savings,
+        initialCapital,
+        {},
+        exchangeRate,
+        buildCatalogPriceMap([], exchangeRate)
+      );
+
+      await setDoc(
+        doc(db, 'portfolios', trimmed),
+        stripUndefinedDeep({
+          ...portfolio,
+          nickname: trimmed,
+          assets: portfolioValues.assets,
+          savings,
+          exchangeRate: INITIAL_SEED_EXCHANGE_RATE,
+          lastExchangeRateUpdate: INITIAL_SEED_TIMESTAMP,
+          totalCurrentValue: buyTotalKrw,
+          totalPurchaseAmount: buyTotalKrw,
+          totalAssets: savings + buyTotalKrw,
+          profitAmount: 0,
+          profitRate: 0,
+          totalProfitAmount: 0,
+          totalProfitRate: 0,
+          transactions: rebuild529TransactionsFromAssets(assets),
+          updatedAt: INITIAL_SEED_TIMESTAMP,
+        })
+      );
+      updated.push(trimmed);
+    }
+
+    return {
+      success: true,
+      updated,
+      message: `✅ 5/29 매수가 반영 완료: ${updated.join(', ') || '(없음)'}`,
+    };
+  } catch (error) {
+    console.error('[apply529ReferencePricesToPortfolios] failed:', error);
+    return {
+      success: false,
+      updated,
+      message: error instanceof Error ? error.message : '매수가 반영 중 오류가 발생했습니다.',
+    };
+  }
+}
+
+/** 【범용 가격 업데이트】 매 회차마다 재사용 — 브라우저 콘솔: await window.updateAssetPricesForSession?.(batch) */
+export interface PriceUpdateEntry {
+  usd?: number;
+  krw: number;
+}
+
+export interface PriceUpdateBatch {
+  sessionDate: string;
+  exchangeRate?: number;
+  priceUpdates: Record<string, PriceUpdateEntry>;
+}
+
+export interface PriceUpdateLogEntry {
+  name: string;
+  type: 'USD' | 'KRW';
+  oldPrice?: number;
+  newPrice: number;
+  changePercent: string;
+}
+
+const PRICE_UPDATE_NAME_ALIASES: Record<string, string> = {
+  알파벳: '알파벳 Class A',
+};
+
+function resolveBulkPriceUpdateName(rawName: string): string {
+  const trimmed = rawName.trim();
+  const alias = PRICE_UPDATE_NAME_ALIASES[trimmed];
+  if (alias) return alias;
+  const preset = getPresetByName(trimmed);
+  return preset?.name ?? trimmed;
+}
+
+function lookupSessionPriceUpdate(
+  assetName: string,
+  priceUpdates: Record<string, PriceUpdateEntry>
+): { canonicalName: string; update: PriceUpdateEntry } | null {
+  const target = resolveBulkPriceUpdateName(assetName).toLowerCase();
+  for (const [key, update] of Object.entries(priceUpdates)) {
+    const canonical = resolveBulkPriceUpdateName(key);
+    if (canonical.toLowerCase() === target) {
+      return { canonicalName: canonical, update };
+    }
+  }
+  return null;
+}
+
+function formatChangePercent(oldValue: number | undefined, newValue: number): string {
+  if (oldValue == null || oldValue <= 0) return 'N/A';
+  return (((newValue - oldValue) / oldValue) * 100).toFixed(2);
+}
+
+async function applySessionExchangeRate(
+  exchangeRate: number,
+  dryRun: boolean
+): Promise<void> {
+  if (dryRun) return;
+  const now = new Date();
+  await setDoc(
+    sharedConfigRef(),
+    stripUndefinedDeep({
+      exchangeRate,
+      lastExchangeRateUpdate: now,
+      lastUpdatedBy: 'admin',
+      updatedAt: now,
+    }),
+    { merge: true }
+  );
+  await setDoc(
+    globalSettingsRef(),
+    stripUndefinedDeep({
+      exchangeRate,
+      lastExchangeRateUpdate: now,
+    }),
+    { merge: true }
+  );
+}
+
+async function applySessionPriceUpdate(
+  canonicalName: string,
+  update: PriceUpdateEntry,
+  sessionDate: string,
+  exchangeRate: number,
+  dryRun: boolean,
+  targetDocId?: string
+): Promise<{ oldPrice?: number; oldPriceUSD?: number; isUsd: boolean }> {
+  const preset = getPresetByName(canonicalName);
+  const type = (preset?.type ?? 'stock') as CustomAsset['type'];
+  const marketRegion: AssetMarket = isForeignPresetName(canonicalName)
+    ? 'US'
+    : inferAssetMarketRegion(canonicalName, type);
+  const isUsdAsset =
+    update.usd != null &&
+    update.usd > 0 &&
+    (isForeignPresetName(canonicalName) || marketRegion === 'US');
+  const displayCurrency: DisplayCurrency = isUsdAsset ? 'USD' : 'KRW';
+
+  const docId = targetDocId ?? resolveSeedAssetDocId(canonicalName);
+  const snap = await getDoc(doc(db, 'customAssets', docId));
+  const existing = snap.exists() ? (snap.data() as CustomAsset) : undefined;
+  const oldPrice = existing?.price;
+  const oldPriceUSD = existing?.priceUSD;
+
+  if (dryRun) {
+    return { oldPrice, oldPriceUSD, isUsd: isUsdAsset };
+  }
+
+  const now = new Date();
+  const updateReason = `${sessionDate} 회차 가격 일괄 업데이트` as AdminPriceUpdateReason;
+  const meta = {
+    lastUpdatedBy: 'admin' as const,
+    lastUpdatedAt: now,
+    updateReason,
+    priceSource: 'admin',
+    lastPriceUpdatedAt: now,
+    sessionDate,
+  };
+
+  const payload: Partial<CustomAsset> = {
+    ...meta,
+    name: canonicalName,
+    type,
+    marketRegion: isUsdAsset ? 'US' : marketRegion,
+    displayCurrency,
+    market: isUsdAsset
+      ? '미국 주식'
+      : marketRegion === 'Korea'
+        ? '국내 주식'
+        : '암호화폐',
+    ...(preset?.ticker ? { ticker: preset.ticker } : {}),
+  };
+
+  if (isUsdAsset && update.usd != null) {
+    payload.priceUSD = update.usd;
+    payload.price = Math.round(update.krw);
+  } else {
+    payload.priceKRW = update.krw;
+    payload.price = Math.round(update.krw);
+  }
+
+  const priceKrw = payload.price!;
+
+  await setDoc(
+    doc(db, 'customPrices', canonicalName),
+    {
+      price: priceKrw,
+      updatedAt: now,
+      source: 'admin_override',
+      lastUpdatedBy: 'admin',
+      updateReason,
+      sessionDate,
+    },
+    { merge: true }
+  );
+
+  await writeSharedMarketPriceClient(canonicalName, priceKrw);
+
+  await setDoc(
+    doc(db, 'customAssets', docId),
+    stripUndefinedDeep({
+      id: docId,
+      addedBy: existing?.addedBy ?? 'admin',
+      addedAt: existing?.addedAt ?? now,
+      ...payload,
+    }),
+    { merge: true }
+  );
+
+  return { oldPrice, oldPriceUSD, isUsd: isUsdAsset };
+}
+
+export async function updateAssetPricesForSession(
+  batch: PriceUpdateBatch,
+  options?: { dryRun?: boolean }
+): Promise<{ updateCount: number; updateLog: PriceUpdateLogEntry[] }> {
+  const { sessionDate, exchangeRate: batchExchangeRate, priceUpdates } = batch;
+  const isDryRun = options?.dryRun ?? false;
+  const exchangeRate = batchExchangeRate ?? (await getGlobalExchangeRate());
+
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`📋 가격 업데이트 배치 (${sessionDate})`);
+  console.log(`${'='.repeat(60)}`);
+  if (isDryRun) console.log('🔍 [드라이런 모드] 실제 저장 안 함');
+  console.log('\n');
+
+  let updateCount = 0;
+  const updateLog: PriceUpdateLogEntry[] = [];
+  const processedDocIds = new Set<string>();
+  const processedCanonical = new Set<string>();
+
+  const recordUpdate = async (
+    canonicalName: string,
+    update: PriceUpdateEntry,
+    docId?: string
+  ): Promise<void> => {
+    const key = canonicalName.toLowerCase();
+    if (processedCanonical.has(key) && !docId) return;
+
+    const resolvedDocId = docId ?? resolveSeedAssetDocId(canonicalName);
+    if (processedDocIds.has(resolvedDocId)) return;
+
+    const { oldPrice, oldPriceUSD, isUsd } = await applySessionPriceUpdate(
+      canonicalName,
+      update,
+      sessionDate,
+      exchangeRate,
+      isDryRun,
+      docId
+    );
+
+    if (isUsd && update.usd != null) {
+      const changePercent = formatChangePercent(oldPriceUSD, update.usd);
+      console.log(`✅ ${canonicalName} (USD)`);
+      console.log(`   ${oldPriceUSD ?? 'N/A'} USD → ${update.usd} USD (${changePercent}%)`);
+      console.log(`   ${oldPrice ?? 'N/A'}원 → ${update.krw}원`);
+      updateLog.push({
+        name: canonicalName,
+        type: 'USD',
+        oldPrice: oldPriceUSD,
+        newPrice: update.usd,
+        changePercent,
+      });
+    } else {
+      const changePercent = formatChangePercent(oldPrice, update.krw);
+      console.log(`✅ ${canonicalName} (KRW)`);
+      console.log(`   ${oldPrice ?? 'N/A'}원 → ${update.krw}원 (${changePercent}%)`);
+      updateLog.push({
+        name: canonicalName,
+        type: 'KRW',
+        oldPrice: oldPrice,
+        newPrice: update.krw,
+        changePercent,
+      });
+    }
+
+    processedDocIds.add(resolvedDocId);
+    processedCanonical.add(key);
+    updateCount++;
+  };
+
+  for (const [assetName, update] of Object.entries(priceUpdates)) {
+    try {
+      const canonicalName = resolveBulkPriceUpdateName(assetName);
+      await recordUpdate(canonicalName, update);
+    } catch (error) {
+      console.warn(`⚠️ ${assetName} 업데이트 실패:`, error);
+    }
+  }
+
+  const customSnap = await getDocs(collection(db, 'customAssets'));
+  for (const docSnap of customSnap.docs) {
+    const raw = docSnap.data() as CustomAsset & { assetName?: string };
+    const assetName = (raw.name ?? raw.assetName ?? '').trim();
+    if (!assetName) continue;
+
+    const match = lookupSessionPriceUpdate(assetName, priceUpdates);
+    if (!match) continue;
+    if (processedDocIds.has(docSnap.id)) continue;
+
+    try {
+      await recordUpdate(match.canonicalName, match.update, docSnap.id);
+    } catch (error) {
+      console.warn(`⚠️ ${assetName} (추가 doc) 업데이트 실패:`, error);
+    }
+  }
+
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(
+    `📊 요약: 총 ${updateCount}개 자산 업데이트${isDryRun ? ' (미실행)' : ' (저장됨)'}`
+  );
+  console.log(`${'='.repeat(60)}\n`);
+
+  // 환율 업데이트 (임시 비활성화 - 보안 규칙 수정 후 재활성화)
+  /*
+  if (batchExchangeRate != null && batchExchangeRate > 0) {
+    console.log(`\n💱 환율 업데이트: ${batchExchangeRate}원/USD`);
+    if (!isDryRun) {
+      await applySessionExchangeRate(batchExchangeRate, false);
+      console.log('✅ 환율 저장됨');
+    }
+  }
+  */
+
+  if (!isDryRun) {
+    console.log('\n⏳ 포트폴리오 재계산 중...');
+    await recalculateAllPortfolios();
+    console.log('✅ 모든 포트폴리오 손익 재계산 완료!\n');
+  } else {
+    console.log('\n💡 드라이런 완료. 문제없으면 { dryRun: false }로 실행하세요.\n');
+  }
+
+  return { updateCount, updateLog };
+}
+
+/** 6/13 회차 catalog 시세 (KRW 또는 USD) — updateAssetPricesForSession용 레거시 맵 */
+const PRICE_UPDATES_20260613: Record<string, number> = {
+  SK하이닉스: 2_150_000,
+  삼성전자: 322_500,
+  현대차: 607_000,
+  두산에너빌리티: 106_805,
+  LG화학: 358_000,
+  NAVER: 212_000,
+  카카오: 45_800,
+  셀트리온: 189_500,
+  'TIGER 반도체TOP10': 53_000,
+  'KODEX 미국S&P500': 25_420,
+  'KODEX 미국나스닥100': 29_645,
+  AMD: 511.57,
+  '알파벳 Class A': 359.68,
+  아마존: 238.55,
+  애플: 291.13,
+  브로드컴: 382.07,
+  메타: 566.98,
+  마이크로소프트: 390.74,
+  마이크론: 981.61,
+  엔비디아: 205.19,
+  팔란티어: 127.99,
+  시놉시스: 453.89,
+  TSMC: 423.93,
+  테슬라: 420.0,
+  ASML: 1_863.55,
+  '노키아 ADR': 14.08,
+  록히드마틴: 540.33,
+  '루멘텀 홀딩스': 921.56,
+  브룩필드: 45.21,
+  '스페이스 X': 106.95,
+  SPY: 741.75,
+  SCHD: 32.82,
+  VOO: 681.95,
+  GLD: 386.54,
+};
+
+function build613PriceUpdateBatch(): PriceUpdateBatch {
+  const priceUpdates: Record<string, PriceUpdateEntry> = {};
+  for (const [name, price] of Object.entries(PRICE_UPDATES_20260613)) {
+    if (isForeignPresetName(name)) {
+      priceUpdates[name] = {
+        usd: price,
+        krw: Math.round(price * DEFAULT_EXCHANGE_RATE),
+      };
+    } else {
+      priceUpdates[name] = { krw: price };
+    }
+  }
+  return { sessionDate: '2026-06-13', priceUpdates };
+}
+
+/** 【6/13 가격 일괄 업데이트】 — 브라우저 콘솔: await window.updatePricesFor20260613?.() */
+export async function updatePricesFor20260613(): Promise<{ updateCount: number }> {
+  const result = await updateAssetPricesForSession(build613PriceUpdateBatch());
+  return { updateCount: result.updateCount };
+}
+
+/** 모든 포트폴리오 조회 */
+export async function getAllPortfolios(): Promise<Portfolio[]> {
+  const snap = await getDocs(collection(db, 'portfolios'));
+  const results: Portfolio[] = [];
+  snap.forEach((docSnap) => {
+    if (docSnap.id === SHARED_CONFIG_DOC_ID) return;
+    results.push({
+      nickname: docSnap.id,
+      ...(docSnap.data() as Omit<Portfolio, 'nickname'>),
+    });
+  });
+  return results;
+}
+
+/** 모든 포트폴리오 손익·평가액 재계산 */
+export async function recalculateAllPortfolios(): Promise<{ portfolioCount: number }> {
+  const exchangeRate = await getGlobalExchangeRate();
+  const customAssets = await getAllCommunityCustomAssets();
+  const catalogPrices = buildCatalogPriceMap(customAssets, exchangeRate);
+  const sharedSnap = await getDoc(sharedConfigRef());
+  const marketPrices = parseSharedMarketPrices(sharedSnap.data());
+
+  const portfolios = await getAllPortfolios();
+  console.log(`\n${portfolios.length}개 포트폴리오 재계산 중...`);
+
+  for (const portfolio of portfolios) {
+    const portfolioExchangeRate = portfolio.exchangeRate ?? exchangeRate;
+    const updated = recalculatePortfolioValues(
+      portfolio,
+      marketPrices,
+      catalogPrices,
+      portfolioExchangeRate
+    );
+
+    await setDoc(
+      doc(db, 'portfolios', portfolio.nickname),
+      stripUndefinedDeep({
+        assets: updated.assets,
+        totalCurrentValue: updated.totalCurrentValue,
+        totalUnrealizedProfit: updated.totalUnrealizedProfit,
+        totalRealizedProfit: updated.totalRealizedProfit,
+        totalAssets: updated.totalAssets,
+        totalProfitAmount: updated.totalProfitAmount,
+        totalProfitRate: updated.totalProfitRate,
+        profitAmount: updated.profitAmount,
+        profitRate: updated.profitRate,
+        totalPurchaseAmount: updated.totalPurchaseAmount,
+        updatedAt: new Date(),
+      }),
+      { merge: true }
+    );
+
+    console.log(`✅ ${portfolio.nickname} 재계산 완료`);
+  }
+
+  return { portfolioCount: portfolios.length };
+}
+
+const MICRON_TESLA_MARKET_FIX_TARGETS = ['마이크론', '테슬라'] as const;
+
+/** Firestore customAssets — 마이크론·테슬라 marketRegion을 US로 정정 */
+export async function fixMicronTeslaMarketRegionInFirestore(): Promise<{
+  updated: string[];
+}> {
+  const updated: string[] = [];
+  const now = new Date();
+  const exchangeRate = await getGlobalExchangeRate();
+
+  const applyFix = async (docId: string, raw: CustomAsset): Promise<void> => {
+    const name = raw.name?.trim();
+    if (!name || !MICRON_TESLA_MARKET_FIX_TARGETS.includes(name as (typeof MICRON_TESLA_MARKET_FIX_TARGETS)[number])) {
+      return;
+    }
+    if (raw.marketRegion === 'US' && raw.displayCurrency === 'USD') return;
+
+    const preset = getPresetByName(name);
+    const priceUSD =
+      sanitizeNumeric(raw.priceUSD) && sanitizeNumeric(raw.priceUSD)! > 0
+        ? sanitizeNumeric(raw.priceUSD)!
+        : preset?.usdPrice;
+
+    await setDoc(
+      doc(db, 'customAssets', docId),
+      stripUndefinedDeep({
+        marketRegion: 'US',
+        displayCurrency: 'USD',
+        market: '미국 주식',
+        ...(priceUSD != null && priceUSD > 0
+          ? {
+              priceUSD,
+              price: Math.round(computeKrwEquivalent('USD', priceUSD, exchangeRate)),
+            }
+          : {}),
+        lastUpdatedBy: 'admin',
+        lastUpdatedAt: now,
+        updateReason: '데이터 정정',
+      }),
+      { merge: true }
+    );
+
+    if (!updated.includes(name)) updated.push(name);
+    console.log(`✅ ${name} → marketRegion: US`);
+  };
+
+  for (const name of MICRON_TESLA_MARKET_FIX_TARGETS) {
+    const docId = resolveSeedAssetDocId(name);
+    const snap = await getDoc(doc(db, 'customAssets', docId));
+    if (snap.exists()) {
+      await applyFix(docId, { ...(snap.data() as CustomAsset), id: docId });
+    }
+  }
+
+  const customSnap = await getDocs(collection(db, 'customAssets'));
+  for (const docSnap of customSnap.docs) {
+    const raw = docSnap.data() as CustomAsset;
+    await applyFix(docSnap.id, { ...raw, id: docSnap.id });
+  }
+
+  console.log(`\n총 ${updated.length}개 자산 marketRegion US로 정정 완료`);
+  return { updated };
+}
+
+if (typeof window !== 'undefined') {
+  window.updatePricesFor20260613 = updatePricesFor20260613;
+  window.updateAssetPricesForSession = updateAssetPricesForSession;
+  window.recalculateAllPortfolios = recalculateAllPortfolios;
+  window.fixMicronTeslaMarketRegionInFirestore = fixMicronTeslaMarketRegionInFirestore;
 }

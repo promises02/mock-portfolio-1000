@@ -2,6 +2,13 @@ import { AssetItem, CustomAsset, Portfolio } from '../types';
 import { RECOMMENDED_ASSETS, ALL_PRESETS, getPresetByName } from '../presets';
 import { DEFAULT_EXCHANGE_RATE, getAssetYieldPercent, inferAssetMarketRegion } from '../utils';
 
+/** 미국 주식: 모의투자 환율 1,500원 고정 (표시·손익 계산 공통) */
+export const US_STOCK_FIXED_EXCHANGE_RATE = DEFAULT_EXCHANGE_RATE;
+
+function usStockRate(_exchangeRate?: number): number {
+  return US_STOCK_FIXED_EXCHANGE_RATE;
+}
+
 /** 관리자 catalog(customAssets + preset) 기준가 — 외부 API 시세와 분리 */
 export interface CatalogPriceEntry {
   priceUsd?: number;
@@ -21,7 +28,7 @@ export function buildCatalogPriceMap(
     if (preset.usdPrice != null && preset.usdPrice > 0) {
       map[name] = {
         priceUsd: preset.usdPrice,
-        priceKrw: Math.round(preset.usdPrice * exchangeRate),
+        priceKrw: Math.round(preset.usdPrice * US_STOCK_FIXED_EXCHANGE_RATE),
       };
     } else if (preset.price > 0) {
       map[name] = { priceKrw: preset.price };
@@ -31,10 +38,11 @@ export function buildCatalogPriceMap(
   for (const asset of customAssets) {
     const name = asset.name.trim();
     if (!name) continue;
+    if (!shouldUseCustomAssetAsCatalogPrice(asset)) continue;
     if (asset.priceUSD != null && asset.priceUSD > 0) {
       map[name] = {
         priceUsd: asset.priceUSD,
-        priceKrw: Math.round(asset.priceUSD * exchangeRate),
+        priceKrw: Math.round(asset.priceUSD * US_STOCK_FIXED_EXCHANGE_RATE),
       };
     } else {
       const krw = asset.priceKRW ?? asset.price;
@@ -43,6 +51,13 @@ export function buildCatalogPriceMap(
   }
 
   return map;
+}
+
+/** community customAssets 중 시장 catalog로 쓸 항목만 (시드·매수 스냅샷 제외) */
+function shouldUseCustomAssetAsCatalogPrice(asset: CustomAsset): boolean {
+  if (asset.addedBy === 'system') return false;
+  if (asset.addedBy === 'admin') return true;
+  return false;
 }
 
 function lookupCatalogEntry(name: string, catalogPrices?: CatalogPriceMap): CatalogPriceEntry | undefined {
@@ -83,22 +98,29 @@ export function isUsMarketAsset(asset: AssetItem): boolean {
   return (asset.market ?? inferAssetMarketRegion(asset.name, asset.type || 'stock')) === 'US';
 }
 
-/** 미국 주식: USD 매수가 (없으면 KRW 매수가를 매입 환율로 역산) */
+/** 미국 주식: USD 평균매입가 (catalog priceUSD는 사용하지 않음) */
 export function getPurchasePriceUsd(asset: AssetItem, exchangeRate: number): number {
+  if (asset.averagePurchasePrice != null && asset.averagePurchasePrice > 0) {
+    return asset.averagePurchasePrice;
+  }
   if (asset.purchasePriceUSD != null && asset.purchasePriceUSD > 0) {
     return asset.purchasePriceUSD;
   }
-  if (asset.priceUSD != null && asset.priceUSD > 0) {
-    return asset.priceUSD;
-  }
-  const purchaseRate = resolvePurchaseExchangeRate(asset, exchangeRate);
-  if (purchaseRate > 0 && asset.price > 0) {
-    return asset.price / purchaseRate;
+  if (asset.price > 0) {
+    const rate =
+      asset.purchaseExchangeRate != null && asset.purchaseExchangeRate > 0
+        ? asset.purchaseExchangeRate
+        : exchangeRate > 0
+          ? exchangeRate
+          : DEFAULT_EXCHANGE_RATE;
+    if (rate > 0) {
+      return asset.price / rate;
+    }
   }
   return 0;
 }
 
-/** 매입 시점 환율 — 저장값 우선, 없으면 KRW/USD 역산 (현재 환율로 대체하지 않음) */
+/** 매입 시점 환율 — 저장값 우선 (미국: 첫 매수 환율 고정) */
 export function resolvePurchaseExchangeRate(
   asset: AssetItem,
   fallbackRate: number = DEFAULT_EXCHANGE_RATE
@@ -107,7 +129,7 @@ export function resolvePurchaseExchangeRate(
     return asset.purchaseExchangeRate;
   }
 
-  const purchaseUsd = asset.purchasePriceUSD ?? asset.priceUSD;
+  const purchaseUsd = asset.purchasePriceUSD ?? asset.averagePurchasePrice;
   if (purchaseUsd != null && purchaseUsd > 0 && asset.price > 0) {
     return Math.round(asset.price / purchaseUsd);
   }
@@ -124,9 +146,7 @@ export function getTotalPurchaseAmountKrw(asset: AssetItem, fallbackRate: number
   }
 
   if (isUsMarketAsset(asset)) {
-    const usd = getPurchasePriceUsd(asset, fallbackRate);
-    const rate = resolvePurchaseExchangeRate(asset, fallbackRate);
-    return Math.round(usd * rate * qty);
+    return Math.round(getPurchaseUnitKrw(asset, fallbackRate) * qty);
   }
 
   return Math.round(getPurchaseUnitKrw(asset, fallbackRate) * qty);
@@ -151,23 +171,29 @@ export function calculateUnrealizedProfit(
   const qty = asset.quantity || 0;
 
   if (market === 'US') {
-    const purchaseUsd = getPurchasePriceUsd(asset, currentExchangeRate);
     const purchaseRate = resolvePurchaseExchangeRate(asset, currentExchangeRate);
-    const currentUsd = getCurrentPriceUsd(asset, marketPrices, currentExchangeRate, catalogPrices);
-    const purchaseAmountKRW = Math.round(purchaseUsd * qty * purchaseRate);
-    const currentAmountKRW = Math.round(currentUsd * qty * currentExchangeRate);
-    const unrealizedProfit = currentAmountKRW - purchaseAmountKRW;
+    const purchaseAmount = getTotalPurchaseAmountKrw(asset, currentExchangeRate);
+    const currentUnit = getCurrentUnitKrw(asset, marketPrices, currentExchangeRate, catalogPrices);
+    const currentAmount = Math.round(currentUnit * qty);
+    const unrealizedProfit = currentAmount - purchaseAmount;
     const unrealizedProfitRate =
-      purchaseAmountKRW > 0 ? (unrealizedProfit / purchaseAmountKRW) * 100 : 0;
+      purchaseAmount > 0 ? (unrealizedProfit / purchaseAmount) * 100 : 0;
+
+    const avgUsd = getPurchasePriceUsd(asset, currentExchangeRate);
+    const currentUsd = getCurrentPriceUsd(asset, marketPrices, currentExchangeRate, catalogPrices);
+    const priceChangeProfit = Math.round(
+      (currentUsd - avgUsd) * purchaseRate * qty
+    );
+    const exchangeRateProfit = unrealizedProfit - priceChangeProfit;
 
     return {
       unrealizedProfit,
       unrealizedProfitRate,
-      currentAmount: currentAmountKRW,
-      purchaseAmount: purchaseAmountKRW,
+      currentAmount,
+      purchaseAmount,
       breakdown: {
-        priceChangeProfit: Math.round((currentUsd - purchaseUsd) * qty * currentExchangeRate),
-        exchangeRateProfit: Math.round(purchaseUsd * qty * (currentExchangeRate - purchaseRate)),
+        priceChangeProfit,
+        exchangeRateProfit,
       },
     };
   }
@@ -201,6 +227,8 @@ function resolveActiveCurrentPriceKrw(
   exchangeRate?: number
 ): number {
   const name = asset.name.trim();
+  const krwRate = exchangeRate;
+
   const adminKrw = marketPrices?.[name];
   if (adminKrw !== undefined && adminKrw > 0) {
     return Math.round(adminKrw);
@@ -213,10 +241,10 @@ function resolveActiveCurrentPriceKrw(
   if (
     catalog?.priceUsd != null &&
     catalog.priceUsd > 0 &&
-    exchangeRate != null &&
-    exchangeRate > 0
+    krwRate != null &&
+    krwRate > 0
   ) {
-    return Math.round(catalog.priceUsd * exchangeRate);
+    return Math.round(catalog.priceUsd * krwRate);
   }
 
   if (asset.currentPrice != null && asset.currentPrice > 0) {
@@ -233,7 +261,7 @@ function resolveActiveCurrentPriceKrw(
 
 /**
  * 미국 주식 USD 현재가.
- * 우선순위: 관리자 marketPrices(+catalog USD) → catalog → 매입가 (자동 API 시세 미사용)
+ * 우선순위: 관리자 marketPrices(KRW→USD) → asset.currentPrice → catalog → 매입가
  */
 export function getCurrentPriceUsd(
   asset: AssetItem,
@@ -242,15 +270,17 @@ export function getCurrentPriceUsd(
   catalogPrices?: CatalogPriceMap
 ): number {
   const name = asset.name.trim();
-  const catalog = lookupCatalogEntry(name, catalogPrices);
   const adminKrw = marketPrices?.[name];
 
   if (adminKrw != null && adminKrw > 0 && exchangeRate > 0) {
-    if (catalog?.priceUsd != null && catalog.priceUsd > 0) {
-      return catalog.priceUsd;
-    }
     return adminKrw / exchangeRate;
   }
+
+  if (asset.currentPrice != null && asset.currentPrice > 0 && exchangeRate > 0) {
+    return asset.currentPrice / exchangeRate;
+  }
+
+  const catalog = lookupCatalogEntry(name, catalogPrices);
 
   if (catalog?.priceUsd != null && catalog.priceUsd > 0) {
     return catalog.priceUsd;
@@ -259,8 +289,7 @@ export function getCurrentPriceUsd(
   if (
     catalog?.priceKrw != null &&
     catalog.priceKrw > 0 &&
-    exchangeRate > 0 &&
-    isUsMarketAsset(asset)
+    exchangeRate > 0
   ) {
     return catalog.priceKrw / exchangeRate;
   }
@@ -281,30 +310,32 @@ export function getCurrentUnitKrw(
   exchangeRate: number,
   catalogPrices?: CatalogPriceMap
 ): number {
-  if (isUsMarketAsset(asset) && exchangeRate > 0) {
+  if (isUsMarketAsset(asset)) {
     const currentUsd = getCurrentPriceUsd(asset, marketPrices, exchangeRate, catalogPrices);
-    if (currentUsd > 0) {
+    if (currentUsd > 0 && exchangeRate > 0) {
       return Math.round(currentUsd * exchangeRate);
     }
+    return 0;
   }
-
   const activeKrw = resolveActiveCurrentPriceKrw(asset, marketPrices, catalogPrices, exchangeRate);
-  if (activeKrw > 0) {
-    return activeKrw;
-  }
-
-  return 0;
+  return activeKrw > 0 ? activeKrw : 0;
 }
 
 export function getPurchaseUnitKrw(asset: AssetItem, fallbackRate: number): number {
   if (isUsMarketAsset(asset)) {
+    const purchaseRate = resolvePurchaseExchangeRate(asset, fallbackRate);
     const purchaseUsd = getPurchasePriceUsd(asset, fallbackRate);
     if (purchaseUsd > 0) {
-      const purchaseRate = resolvePurchaseExchangeRate(asset, fallbackRate);
       return Math.round(purchaseUsd * purchaseRate);
+    }
+    if (asset.price > 0) {
+      return Math.round(asset.price);
     }
   }
 
+  if (asset.averagePurchasePrice != null && asset.averagePurchasePrice > 0) {
+    return Math.round(asset.averagePurchasePrice);
+  }
   if (asset.price > 0) {
     return Math.round(asset.price);
   }
@@ -312,34 +343,34 @@ export function getPurchaseUnitKrw(asset: AssetItem, fallbackRate: number): numb
   return 0;
 }
 
-/** 레거시 데이터: purchaseExchangeRate·purchasePriceUSD 누락 시에만 보정 (현재 환율로 덮어쓰지 않음) */
+/** 레거시: 매입 KRW(asset.price) 우선 — catalog USD(priceUSD)로 매입가를 덮어쓰지 않음 */
 export function normalizeUsAssetPurchaseBasis(
   asset: AssetItem,
   fallbackRate: number
 ): AssetItem {
   if (!isUsMarketAsset(asset)) return asset;
 
-  const purchaseUsd = asset.purchasePriceUSD ?? asset.priceUSD;
-  if (purchaseUsd == null || purchaseUsd <= 0) return asset;
+  const purchaseRate = resolvePurchaseExchangeRate(asset, fallbackRate);
+  const qty = asset.quantity || 0;
+  let purchaseUsd = getPurchasePriceUsd(asset, fallbackRate);
+  let purchaseUnitKrw =
+    purchaseUsd > 0 ? Math.round(purchaseUsd * purchaseRate) : asset.price > 0 ? Math.round(asset.price) : 0;
 
-  let purchaseExchangeRate = asset.purchaseExchangeRate;
-  if (purchaseExchangeRate == null && asset.price > 0) {
-    purchaseExchangeRate = Math.round(asset.price / purchaseUsd);
-  }
-  if (purchaseExchangeRate == null || purchaseExchangeRate <= 0) {
-    purchaseExchangeRate = fallbackRate;
+  if (purchaseUsd <= 0 && purchaseUnitKrw > 0 && purchaseRate > 0) {
+    purchaseUsd = purchaseUnitKrw / purchaseRate;
   }
 
-  const price = Math.round(purchaseUsd * purchaseExchangeRate);
-  const totalPurchaseAmount = Math.round(purchaseUsd * purchaseExchangeRate * (asset.quantity || 0));
+  if (purchaseUsd <= 0 && purchaseUnitKrw <= 0) {
+    return asset;
+  }
 
   return {
     ...asset,
+    averagePurchasePrice: purchaseUsd,
     purchasePriceUSD: purchaseUsd,
-    priceUSD: asset.priceUSD ?? purchaseUsd,
-    purchaseExchangeRate,
-    price,
-    totalPurchaseAmount,
+    price: purchaseUnitKrw,
+    purchaseExchangeRate: purchaseRate,
+    totalPurchaseAmount: Math.round(purchaseUnitKrw * qty),
   };
 }
 
@@ -349,15 +380,12 @@ export function computeUsAssetProfitBreakdown(
   exchangeRate: number,
   catalogPrices?: CatalogPriceMap
 ): { priceChangeProfit: number; exchangeRateProfit: number } {
-  const qty = asset.quantity || 0;
-  const purchaseUsd = getPurchasePriceUsd(asset, exchangeRate);
-  const currentUsd = getCurrentPriceUsd(asset, marketPrices, exchangeRate, catalogPrices);
-  const purchaseRate = resolvePurchaseExchangeRate(asset, exchangeRate);
-
-  const priceChangeProfit = Math.round((currentUsd - purchaseUsd) * qty * exchangeRate);
-  const exchangeRateProfit = Math.round(purchaseUsd * qty * (exchangeRate - purchaseRate));
-
-  return { priceChangeProfit, exchangeRateProfit };
+  const rate = exchangeRate;
+  const unrealized = calculateUnrealizedProfit(asset, marketPrices, rate, catalogPrices);
+  return {
+    priceChangeProfit: unrealized.unrealizedProfit,
+    exchangeRateProfit: 0,
+  };
 }
 
 export function computeAssetPnL(
@@ -366,18 +394,19 @@ export function computeAssetPnL(
   exchangeRate: number,
   catalogPrices?: CatalogPriceMap
 ): AssetPnLSummary {
+  const pnlRate = exchangeRate;
   const normalized = isUsMarketAsset(asset)
-    ? normalizeUsAssetPurchaseBasis(asset, exchangeRate)
+    ? normalizeUsAssetPurchaseBasis(asset, pnlRate)
     : asset;
-  const unrealized = calculateUnrealizedProfit(normalized, marketPrices, exchangeRate, catalogPrices);
+  const unrealized = calculateUnrealizedProfit(normalized, marketPrices, pnlRate, catalogPrices);
   const quantity = normalized.quantity || 0;
   const purchaseUnitKrw =
-    quantity > 0 ? Math.round(unrealized.purchaseAmount / quantity) : getPurchaseUnitKrw(normalized, exchangeRate);
+    quantity > 0 ? Math.round(unrealized.purchaseAmount / quantity) : getPurchaseUnitKrw(normalized, pnlRate);
   const currentUnitKrw =
     quantity > 0
       ? Math.round(unrealized.currentAmount / quantity)
-      : getCurrentUnitKrw(normalized, marketPrices, exchangeRate, catalogPrices);
-  const priceChangeRate = getAssetYieldPercent(normalized, currentUnitKrw, exchangeRate);
+      : getCurrentUnitKrw(normalized, marketPrices, pnlRate, catalogPrices);
+  const priceChangeRate = getAssetYieldPercent(normalized, currentUnitKrw, pnlRate);
 
   return {
     purchaseUnitKrw,
@@ -388,7 +417,7 @@ export function computeAssetPnL(
     profitRate: unrealized.unrealizedProfitRate,
     priceChangeRate,
     purchaseExchangeRate: isUsMarketAsset(normalized)
-      ? resolvePurchaseExchangeRate(normalized, exchangeRate)
+      ? resolvePurchaseExchangeRate(normalized, pnlRate)
       : undefined,
     priceChangeProfit: unrealized.breakdown?.priceChangeProfit,
     exchangeRateProfit: unrealized.breakdown?.exchangeRateProfit,
@@ -439,13 +468,11 @@ export function computeSellPreview(
   const qty = Math.max(0, Math.floor(sellQuantity));
 
   if (isUsMarketAsset(normalized)) {
-    const purchaseUsd = getPurchasePriceUsd(normalized, exchangeRate);
-    const purchaseRate = resolvePurchaseExchangeRate(normalized, exchangeRate);
-    const currentUsd = getCurrentPriceUsd(normalized, marketPrices, exchangeRate, catalogPrices);
-    const sellPriceKrw = Math.round(currentUsd * exchangeRate);
-    const purchasePriceKrw = Math.round(purchaseUsd * purchaseRate);
-    const sellAmount = Math.round(currentUsd * exchangeRate * qty);
-    const purchaseAmount = Math.round(purchaseUsd * purchaseRate * qty);
+    const rate = exchangeRate;
+    const sellPriceKrw = getCurrentUnitKrw(normalized, marketPrices, rate, catalogPrices);
+    const purchasePriceKrw = getPurchaseUnitKrw(normalized, rate);
+    const sellAmount = Math.round(sellPriceKrw * qty);
+    const purchaseAmount = Math.round(purchasePriceKrw * qty);
     const realizedProfit = sellAmount - purchaseAmount;
     const profitRate = purchaseAmount > 0 ? (realizedProfit / purchaseAmount) * 100 : 0;
 
@@ -457,12 +484,10 @@ export function computeSellPreview(
       realizedProfit,
       profitRate,
       cashAfter: currentSavings + sellAmount,
-      currentPriceUsd: currentUsd,
-      purchasePriceUsd: purchaseUsd,
-      purchaseExchangeRate: purchaseRate,
-      currentExchangeRate: exchangeRate,
-      priceChangeProfit: Math.round((currentUsd - purchaseUsd) * qty * exchangeRate),
-      exchangeRateProfit: Math.round(purchaseUsd * qty * (exchangeRate - purchaseRate)),
+      currentExchangeRate: rate,
+      purchaseExchangeRate: resolvePurchaseExchangeRate(normalized, rate),
+      priceChangeProfit: realizedProfit,
+      exchangeRateProfit: 0,
     };
   }
 
@@ -496,6 +521,7 @@ export function mergeUsAssetOnBuy(
   | 'price'
   | 'quantity'
   | 'currentPrice'
+  | 'averagePurchasePrice'
   | 'purchasePriceUSD'
   | 'priceUSD'
   | 'purchaseExchangeRate'
@@ -503,7 +529,11 @@ export function mergeUsAssetOnBuy(
 > {
   const oldQty = existing.quantity || 0;
   const newQty = oldQty + addQty;
-  const oldUsd = existing.purchasePriceUSD ?? existing.priceUSD ?? priceUsd;
+  const oldUsd =
+    existing.purchasePriceUSD ??
+    (existing.price > 0
+      ? existing.price / resolvePurchaseExchangeRate(existing, exchangeRate)
+      : priceUsd);
   const purchaseExchangeRate = resolvePurchaseExchangeRate(existing, exchangeRate);
   const newAvgUsd = (oldUsd * oldQty + priceUsd * addQty) / newQty;
   const newAvgPriceKrw = Math.round(newAvgUsd * purchaseExchangeRate);
@@ -513,6 +543,7 @@ export function mergeUsAssetOnBuy(
     quantity: newQty,
     price: newAvgPriceKrw,
     currentPrice: unitPriceKrw,
+    averagePurchasePrice: newAvgUsd,
     purchasePriceUSD: newAvgUsd,
     priceUSD: priceUsd,
     purchaseExchangeRate,
@@ -530,6 +561,7 @@ export function buildUsAssetOnFirstBuy(
   AssetItem,
   | 'price'
   | 'currentPrice'
+  | 'averagePurchasePrice'
   | 'purchasePriceUSD'
   | 'priceUSD'
   | 'purchaseExchangeRate'
@@ -540,6 +572,7 @@ export function buildUsAssetOnFirstBuy(
   return {
     price,
     currentPrice: unitPriceKrw,
+    averagePurchasePrice: priceUsd,
     purchasePriceUSD: priceUsd,
     priceUSD: priceUsd,
     purchaseExchangeRate,
@@ -575,13 +608,15 @@ export function computePortfolioProfitSummary(
     isUsMarketAsset(asset) ? normalizeUsAssetPurchaseBasis(asset, exchangeRate) : asset
   );
   const totalPurchaseAmount = normalized.reduce(
-    (sum, asset) =>
-      sum + calculateUnrealizedProfit(asset, marketPrices, exchangeRate, catalogPrices).purchaseAmount,
+    (sum, asset) => {
+      return sum + calculateUnrealizedProfit(asset, marketPrices, exchangeRate, catalogPrices).purchaseAmount;
+    },
     0
   );
   const totalCurrentValue = normalized.reduce(
-    (sum, asset) =>
-      sum + calculateUnrealizedProfit(asset, marketPrices, exchangeRate, catalogPrices).currentAmount,
+    (sum, asset) => {
+      return sum + calculateUnrealizedProfit(asset, marketPrices, exchangeRate, catalogPrices).currentAmount;
+    },
     0
   );
   const unrealizedProfit = Math.round(totalCurrentValue - totalPurchaseAmount);
@@ -687,12 +722,11 @@ export function computeBrokeragePortfolioMetrics(
     exchangeRate
   );
   const totalCurrentValue = Math.round(
-    normalized.reduce(
-      (sum, asset) =>
-        sum +
-        calculateUnrealizedProfit(asset, marketPrices, exchangeRate, catalogPrices).currentAmount,
-      0
-    )
+    normalized.reduce((sum, asset) => {
+      return (
+        sum + calculateUnrealizedProfit(asset, marketPrices, exchangeRate, catalogPrices).currentAmount
+      );
+    }, 0)
   );
   const totalAssets = Math.round(savings + totalCurrentValue);
   const totalProfitAmount = totalAssets - initialCapital;

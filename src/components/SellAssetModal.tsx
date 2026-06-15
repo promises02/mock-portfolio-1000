@@ -1,6 +1,6 @@
 import React, { useMemo, useState, useEffect } from 'react';
 import { AssetItem } from '../types';
-import { formatCommas, DEFAULT_EXCHANGE_RATE } from '../utils';
+import { formatCommas, DEFAULT_EXCHANGE_RATE, getDisplayPrice } from '../utils';
 import { computeSellPreview, getProfitStyle, isUsMarketAsset, CatalogPriceMap } from '../utils/portfolioPnL';
 import { Loader2, X } from 'lucide-react';
 
@@ -40,6 +40,10 @@ export const SellAssetModal: React.FC<SellAssetModalProps> = ({
 
   const profitStyle = getProfitStyle(preview.realizedProfit);
   const isValid = quantity >= 1 && quantity <= maxQty && Number.isInteger(quantity);
+  const purchaseDisplay = getDisplayPrice(asset, preview.purchaseExchangeRate ?? exchangeRate, {
+    priceKrw: preview.purchasePriceKrw,
+    priceUsd: preview.purchasePriceUsd,
+  });
 
   const adjustQuantity = (delta: number) => {
     setQuantity((prev) => Math.min(maxQty, Math.max(1, prev + delta)));
@@ -72,16 +76,13 @@ export const SellAssetModal: React.FC<SellAssetModalProps> = ({
 
         <form onSubmit={handleSubmit} className="divide-y divide-slate-100">
           <div className="p-5 space-y-2 text-sm">
-            {isUs && preview.purchaseExchangeRate != null ? (
+            {isUs ? (
               <>
-                <Row
-                  label="평균 매입가"
-                  value={`${formatCommas(preview.purchaseExchangeRate)}원/USD (고정!)`}
-                />
+                <Row label="매수가" value={purchaseDisplay} />
                 {preview.currentPriceUsd != null && (
                   <Row
                     label="현재가"
-                    value={`${preview.currentPriceUsd.toFixed(0)} USD × ${formatCommas(exchangeRate)}원 = ${formatCommas(Math.round(preview.sellPriceKrw))}원`}
+                    value={`${preview.currentPriceUsd.toFixed(2)} USD × ${formatCommas(exchangeRate)}원 = ${formatCommas(Math.round(preview.sellPriceKrw))}원`}
                   />
                 )}
               </>
@@ -129,9 +130,7 @@ export const SellAssetModal: React.FC<SellAssetModalProps> = ({
           <div className="p-5 space-y-2 text-sm">
             <Row label="매도금액" value={`${formatCommas(preview.sellAmount)}원`} bold />
             <Row label="매입금액" value={`${formatCommas(preview.purchaseAmount)}원`} />
-            {!isUs && (
-              <Row label="매수가" value={`${formatCommas(Math.round(preview.purchasePriceKrw))}원`} />
-            )}
+            <Row label="매수가" value={purchaseDisplay} />
           </div>
 
           <div className="p-5 space-y-2 text-sm">

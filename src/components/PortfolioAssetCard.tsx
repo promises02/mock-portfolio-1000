@@ -6,8 +6,8 @@ import {
   getProfitStyle,
   resolveAssetTicker,
   isUsMarketAsset,
-  getPurchasePriceUsd,
   type CatalogPriceMap,
+  US_STOCK_FIXED_EXCHANGE_RATE,
 } from '../utils/portfolioPnL';
 import { Pencil, Trash2 } from 'lucide-react';
 
@@ -65,17 +65,13 @@ export const PortfolioAssetCard: React.FC<PortfolioAssetCardProps> = ({
   const pnl = computeAssetPnL(asset, marketPrices, exchangeRate, catalogPrices);
   const profitStyle = getProfitStyle(pnl.profitAmount);
   const isUs = isUsMarketAsset(asset);
-  const purchaseUsd = isUs ? getPurchasePriceUsd(asset, exchangeRate) : undefined;
+  const displayExchangeRate = isUs ? US_STOCK_FIXED_EXCHANGE_RATE : exchangeRate;
 
-  const purchaseDisplay = getDisplayPrice(asset, pnl.purchaseExchangeRate ?? exchangeRate, {
+  const purchaseDisplay = getDisplayPrice(asset, displayExchangeRate, {
     priceKrw: pnl.purchaseUnitKrw,
-    priceUsd: purchaseUsd,
-    priceCrypto: asset.priceCrypto,
   });
-  const currentDisplay = getDisplayPrice(asset, exchangeRate, {
+  const currentDisplay = getDisplayPrice(asset, displayExchangeRate, {
     priceKrw: pnl.currentUnitKrw,
-    priceUsd: isUs ? pnl.currentUnitKrw / exchangeRate : asset.priceUSD,
-    priceCrypto: asset.priceCrypto,
   });
 
   const priceChangeStyle = getProfitStyle(pnl.priceChangeRate);
@@ -137,20 +133,7 @@ export const PortfolioAssetCard: React.FC<PortfolioAssetCardProps> = ({
         <div className="px-4 py-3 space-y-2 border-b md:border-b-0 border-slate-100">
           <p className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider">매수 정보</p>
           <div className="space-y-1.5">
-            {isUs && pnl.purchaseExchangeRate != null ? (
-              <Row
-                label="평균 매입가"
-                value={`${formatCommas(pnl.purchaseExchangeRate)}원/USD (고정!)`}
-              />
-            ) : (
-              <Row label="매수가" value={purchaseDisplay} />
-            )}
-            {isUs && pnl.purchaseExchangeRate != null && (
-              <Row
-                label="매수 환율"
-                value={`1 USD = ${formatCommas(pnl.purchaseExchangeRate)}원`}
-              />
-            )}
+            <Row label="매수가" value={purchaseDisplay} />
             <Row label="수량" value={formatQuantity(asset.quantity)} />
             <Row label="매입금액" value={`${formatCommas(pnl.purchaseAmount)}원`} bold />
           </div>
@@ -170,7 +153,7 @@ export const PortfolioAssetCard: React.FC<PortfolioAssetCardProps> = ({
               </span>
             </div>
             {isUs && (
-              <Row label="현재 환율" value={`1 USD = ${formatCommas(exchangeRate)}원`} />
+              <Row label="적용 환율" value={`1 USD = ${formatCommas(US_STOCK_FIXED_EXCHANGE_RATE)}원 (고정)`} />
             )}
             <Row label="평가금액" value={`${formatCommas(pnl.currentAmount)}원`} bold />
           </div>
@@ -192,21 +175,6 @@ export const PortfolioAssetCard: React.FC<PortfolioAssetCardProps> = ({
                 {formatSignedPercent(pnl.profitRate)} {profitStyle.icon}
               </span>
             </div>
-            {isUs &&
-              pnl.priceChangeProfit != null &&
-              pnl.exchangeRateProfit != null && (
-                <div className="pt-1 space-y-1 border-t border-slate-100 mt-1">
-                  <p className="text-[10px] font-bold text-slate-400">손익 분해</p>
-                  <Row
-                    label="가격 변동"
-                    value={formatSignedAmount(pnl.priceChangeProfit)}
-                  />
-                  <Row
-                    label="환율 변동"
-                    value={formatSignedAmount(pnl.exchangeRateProfit)}
-                  />
-                </div>
-              )}
           </div>
         </div>
       </div>

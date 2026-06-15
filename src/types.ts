@@ -21,46 +21,75 @@ export const SECTOR_OPTIONS = [
 
 export type SectorOption = (typeof SECTOR_OPTIONS)[number];
 
-/** 자산별 매수/매도 거래 이력 */
+/** logicalName: accurateProfitCalculationV2_withExchangeRate — 자산별 매수/매도 거래 이력 */
 export interface PurchaseRecord {
   id: string;
   type: 'BUY' | 'SELL';
   quantity: number;
+  /** 거래 당시 단가 — USD 자산: USD, 국내/Crypto: KRW */
   price: number;
+  /** KRW 환산 거래금액 */
   amount: number;
+  /** USD 자산 거래 시점 환율 (KRW/USD) */
   exchangeRateAtTransaction?: number;
+  /** @deprecated amount 와 동일 — 하위 호환 */
   amountInKRW?: number;
+  /** 매도 시 평균 매입가 (거래 당시, native currency) */
   averagePriceAtSale?: number;
+  /** @deprecated averagePriceAtSale 보조 — 하위 호환 */
   averageExchangeRateAtSale?: number;
+  /** 매도 실현 손익 (KRW) */
   realizedProfit?: number;
   realizedProfitRate?: number;
   timestamp: any;
+  /** YYYY-MM-DD */
   date: string;
 }
 
+/**
+ * logicalName: accurateProfitCalculationV2_withExchangeRate
+ * 포트폴리오 보유 종목 — 평균매입가법 + 환율 분리
+ */
 export interface AssetItem {
+  /** Firestore customAssets doc id (선택) */
+  id?: string;
   name: string;
-  type: AssetType; // Type of investment asset
+  /** @alias name — 하위 호환 */
+  assetName?: string;
+  type: AssetType;
   /**
-   * 평균 매입가 (KRW/주 또는 국내 주식 원화 단가).
-   * 미국 주식: purchasePriceUSD × purchaseExchangeRate.
+   * 평균 매입가 (KRW/주).
+   * 미국 주식: averagePurchasePrice × purchaseExchangeRate 와 동기화.
    * 매수 시에만 갱신, 매도 시 절대 변하지 않음.
    */
   price: number;
   quantity: number;
+  /**
+   * 현재 시세 (native currency).
+   * US: USD/주, Korea/Crypto: KRW/주 — 없으면 catalog/admin 시세 사용.
+   */
   currentPrice?: number;
-  /** USD 주당 평균 매입가 (averagePurchasePrice) */
+  /**
+   * 평균 매입가 (native currency).
+   * US: USD/주 (= purchasePriceUSD), Korea/Crypto: KRW/주 (= price).
+   */
+  averagePurchasePrice?: number;
+  /** USD 주당 평균 매입가 — averagePurchasePrice(US) 와 동일 */
   priceUSD?: number;
   priceKRW?: number;
   priceCrypto?: string;
-  /** USD 주당 평균 매입가 — priceUSD와 동일, 매도 후에도 유지 */
+  /** USD 주당 평균 매입가 */
   purchasePriceUSD?: number;
-  /** 첫 매수 시점 환율 (KRW/USD). 추가 매수·매도 후에도 변경 없음 */
+  /**
+   * 첫 매수 시점 환율 (KRW/USD). 추가 매수·매도 후에도 변경 없음.
+   * 국내/Crypto: 1 (무시)
+   */
   purchaseExchangeRate?: number;
-  /** 총 매입금액 KRW (purchasePriceUSD × purchaseExchangeRate × quantity) */
+  /** 총 매입금액 KRW (averagePurchasePrice × purchaseExchangeRate × quantity) */
   totalPurchaseAmount?: number;
-  /** UI용 미실현 손익 스냅샷 */
+  /** 미실현 손익 (KRW) — 자동 계산 스냅샷 */
   unrealizedProfit?: number;
+  /** 미실현 손익률 (%) */
   unrealizedProfitRate?: number;
   market?: AssetMarket;
   displayCurrency?: DisplayCurrency;
@@ -99,6 +128,8 @@ export interface CustomAsset {
   lastUpdatedBy?: LastUpdatedBy;
   lastUpdatedAt?: any;
   updateReason?: AdminPriceUpdateReason;
+  /** 관리자 회차별 가격 업데이트 배치 날짜 (YYYY-MM-DD) */
+  sessionDate?: string;
 }
 
 export type LastUpdatedBy = 'api' | 'admin';
@@ -107,7 +138,9 @@ export type AdminPriceUpdateReason =
   | '시장 변동'
   | '데이터 정정'
   | '기술적 오류'
-  | '기타';
+  | '기타'
+  | '6/13 회차 가격 일괄 업데이트'
+  | `${string} 회차 가격 일괄 업데이트`;
 
 export type AdminExchangeRateUpdateReason =
   | '실시간 환율 반영'
@@ -208,33 +241,37 @@ export interface Portfolio {
   assets: AssetItem[];
   /** 파킹통장 현금 */
   savings: number;
-  /** USD/KRW 환율 (기본 1500) */
+  /** 현재 환율 (KRW/USD) — 미국 주식 평가·손익에 사용 */
   exchangeRate?: number;
   lastExchangeRateUpdate?: any;
-  /** 초기 자본 — 포트폴리오 생성 시 고정, 이후 변경 없음 */
+  /** 초기 자본 — 포트폴리오 생성 시 고정 */
   initialCapital?: number;
-  /** 보유 자산 평가금액 합계 (현금 제외) */
+  /** 보유 자산 평가금액 (현재가 × 수량, KRW) */
   totalCurrentValue?: number;
-  /** 미실현 손익 (KRW) — 보유 자산 평가 기준, 현금 변동 없음 */
+  /** 총 미실현 손익 (KRW) */
+  totalUnrealizedProfit?: number;
+  /** @deprecated totalUnrealizedProfit — 하위 호환 */
   profitAmount?: number;
   /** 미실현 수익률 (%) — 매입금액 대비 */
   profitRate?: number;
+  /** 총 실현 손익 (KRW) — 매도 확정 */
+  totalRealizedProfit?: number;
+  /** @deprecated totalRealizedProfit — 하위 호환 */
+  cumulativeRealizedProfit?: number;
   /** 현재 총자산 = savings + totalCurrentValue */
   totalAssets?: number;
-  /** 전체 손익액 = totalAssets − initialCapital */
+  /** 종합 손익 = totalRealizedProfit + totalUnrealizedProfit */
   totalProfitAmount?: number;
-  /** 종합 실질 수익률 (%) */
+  /** 종합 수익률 (%) = totalProfitAmount / initialCapital */
   totalProfitRate?: number;
   /** 총 매입금액 (KRW) */
   totalPurchaseAmount?: number;
   hasRealPrices?: boolean;
   updatedAt: any;
   reason?: string;
-  /** @deprecated 가용 예산 한도 — cumulativeRealizedProfit 기반 */
+  /** @deprecated 가용 예산 한도 */
   totalBudget?: number;
-  /** 매도로 확정된 누적 실현 손익 (KRW) */
-  cumulativeRealizedProfit?: number;
-  /** @deprecated profitAmount와 동일 — 하위 호환 */
+  /** @deprecated profitAmount 와 동일 */
   unrealizedProfitAmount?: number;
   transactions?: Transaction[];
 }
