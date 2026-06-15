@@ -20,6 +20,9 @@ import {
   inferAssetMarket,
   inferAssetSector,
   resolveMarketPriceKRW,
+  roundFractionalQuantity,
+  getQuantityUnitLabel,
+  formatQuantityDisplay,
 } from '../utils';
 import {
   CatalogPriceMap,
@@ -217,6 +220,16 @@ function formatUsdPrice(usd: number): string {
   return usd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+/** 카드 너비 내 가격 한 줄 표시 — 문자 수에 따라 글자 크기 축소 */
+function resolveCompactPriceFontSize(priceText: string): string {
+  const length = priceText.length;
+  if (length >= 14) return 'text-[8px] sm:text-[9px]';
+  if (length >= 12) return 'text-[9px] sm:text-[10px]';
+  if (length >= 10) return 'text-[10px] sm:text-[11px]';
+  if (length >= 8) return 'text-[11px] sm:text-[12px]';
+  return 'text-[13px] sm:text-[15px]';
+}
+
 function resolvePickableDisplayPriceKrw(
   asset: PickableAsset,
   exchangeRate: number,
@@ -288,20 +301,33 @@ export const BuyAssetModal: React.FC<BuyAssetModalProps> = ({
   const [error, setError] = useState('');
 
   const isUsAsset = asset.marketRegion === 'US' && asset.priceUSD != null && asset.priceUSD > 0;
+  const isCryptoAsset = asset.marketRegion === 'Crypto' || asset.type === 'crypto';
+  const assetRef = {
+    name: asset.name,
+    type: asset.type,
+    market: asset.marketRegion,
+  };
+  const unitLabel = getQuantityUnitLabel(assetRef);
+  const qtyStep = isCryptoAsset ? 'any' : '1';
   const baseKrw = isUsAsset
     ? Math.round(convertToKRW(asset.priceUSD!, exchangeRate))
     : asset.priceKRW;
   const unitPriceKrw = resolveMarketPriceKRW(asset.name, baseKrw, marketPrices, catalogPrices);
 
   const qty = parseFloat(quantity) || 0;
-  const estimatedTotal = Math.round(unitPriceKrw * qty);
+  const normalizedQty = isCryptoAsset ? roundFractionalQuantity(qty, assetRef) : Math.floor(qty);
+  const estimatedTotal = Math.round(unitPriceKrw * normalizedQty);
   const cashAfter = availableCash - estimatedTotal;
-  const canAfford = qty > 0 && estimatedTotal <= availableCash;
+  const canAfford = normalizedQty > 0 && estimatedTotal <= availableCash;
 
   const handleBuy = async () => {
     setError('');
-    if (qty <= 0) {
+    if (normalizedQty <= 0) {
       setError('수량은 0보다 커야 합니다.');
+      return;
+    }
+    if (!isCryptoAsset && !Number.isInteger(normalizedQty)) {
+      setError('주식·ETF 수량은 1 이상의 정수여야 합니다.');
       return;
     }
     if (!canAfford) {
@@ -320,7 +346,7 @@ export const BuyAssetModal: React.FC<BuyAssetModalProps> = ({
       if (isUsAsset && asset.priceUSD != null) {
         const merged = mergeUsAssetOnBuy(
           existing,
-          qty,
+          normalizedQty,
           unitPriceKrw,
           asset.priceUSD,
           exchangeRate
@@ -329,9 +355,11 @@ export const BuyAssetModal: React.FC<BuyAssetModalProps> = ({
           index === existingIndex ? { ...item, ...merged } : item
         );
       } else {
-        const newQty = existing.quantity + qty;
+        const newQty = isCryptoAsset
+          ? roundFractionalQuantity(existing.quantity + normalizedQty, assetRef)
+          : existing.quantity + normalizedQty;
         const newAvgPrice = Math.round(
-          (existing.price * existing.quantity + unitPriceKrw * qty) / newQty
+          (existing.price * existing.quantity + unitPriceKrw * normalizedQty) / newQty
         );
         nextAssets = assets.map((item, index) =>
           index === existingIndex
@@ -340,6 +368,17 @@ export const BuyAssetModal: React.FC<BuyAssetModalProps> = ({
                 quantity: newQty,
                 price: newAvgPrice,
                 currentPrice: unitPriceKrw,
+                ...(isCryptoAsset
+                  ? {
+                      totalPurchaseAmount:
+                        Math.round(
+                          (existing.totalPurchaseAmount ?? existing.price * existing.quantity) +
+                            estimatedTotal
+                        ),
+                      displayCurrency: 'CRYPTO' as const,
+                      market: 'Crypto' as const,
+                    }
+                  : {}),
               }
             : item
         );
@@ -350,10 +389,10 @@ export const BuyAssetModal: React.FC<BuyAssetModalProps> = ({
           name: asset.name,
           type: asset.type,
           price: unitPriceKrw,
-          quantity: qty,
+          quantity: normalizedQty,
           currentPrice: unitPriceKrw,
           market: asset.marketRegion,
-          displayCurrency: isUsAsset ? 'USD' : 'KRW',
+          displayCurrency: isUsAsset ? 'USD' : isCryptoAsset ? 'CRYPTO' : 'KRW',
           ...(isUsAsset && asset.priceUSD != null
             ? {
                 priceUSD: asset.priceUSD,
@@ -373,8 +412,12 @@ export const BuyAssetModal: React.FC<BuyAssetModalProps> = ({
         {
           ...enriched,
           ...(isUsAsset && asset.priceUSD != null
-            ? buildUsAssetOnFirstBuy(unitPriceKrw, asset.priceUSD, exchangeRate, qty)
-            : { price: unitPriceKrw, currentPrice: unitPriceKrw }),
+            ? buildUsAssetOnFirstBuy(unitPriceKrw, asset.priceUSD, exchangeRate, normalizedQty)
+            : {
+                price: unitPriceKrw,
+                currentPrice: unitPriceKrw,
+                ...(isCryptoAsset ? { totalPurchaseAmount: estimatedTotal } : {}),
+              }),
         },
       ];
     }
@@ -391,7 +434,7 @@ export const BuyAssetModal: React.FC<BuyAssetModalProps> = ({
       if (onPersistPortfolio) {
         await onPersistPortfolio(nextAssets);
       }
-      onSuccess(`${asset.name} ${qty}주를 ${formatCommas(estimatedTotal)}원에 매수했습니다`);
+      onSuccess(`${asset.name} ${formatQuantityDisplay(normalizedQty, assetRef)}${unitLabel}를 ${formatCommas(estimatedTotal)}원에 매수했습니다`);
       onClose();
     } catch (err) {
       const msg = err instanceof Error ? err.message : '매수 중 오류가 발생했습니다.';
@@ -444,12 +487,12 @@ export const BuyAssetModal: React.FC<BuyAssetModalProps> = ({
 
           <div>
             <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">
-              수량 (주)
+              수량 ({unitLabel})
             </label>
             <input
               type="number"
               min="0"
-              step="1"
+              step={qtyStep}
               value={quantity}
               onChange={(e) => setQuantity(e.target.value)}
               disabled={isBuying}
@@ -528,6 +571,12 @@ const CompactAssetCard: React.FC<{
     ? Math.round(convertToKRW(asset.priceUSD!, exchangeRate))
     : asset.priceKRW;
   const priceKrw = resolveMarketPriceKRW(asset.name, baseKrw, marketPrices, catalogPrices);
+  const krwPriceText = `${formatCommas(priceKrw)}원`;
+  const krwPriceSizeClass = resolveCompactPriceFontSize(krwPriceText);
+  const usdPriceText = isUsAsset ? `$${formatUsdPrice(asset.priceUSD!)}` : '';
+  const usdPriceSizeClass = usdPriceText
+    ? resolveCompactPriceFontSize(usdPriceText)
+    : krwPriceSizeClass;
 
   return (
     <div
@@ -561,7 +610,7 @@ const CompactAssetCard: React.FC<{
           <Plus className="w-3.5 h-3.5" />
         </button>
       </div>
-      <div>
+      <div className="min-w-0">
         <p className={`text-[13px] font-semibold text-slate-800 truncate leading-tight`}>
           {asset.displayName ?? asset.name}
           {asset.isCustom && (
@@ -569,17 +618,23 @@ const CompactAssetCard: React.FC<{
           )}
         </p>
         {isUsAsset ? (
-          <div className="mt-1 space-y-0.5">
-            <p className={`text-[14px] font-bold font-mono ${marketStyle.price} leading-none`}>
-              ${formatUsdPrice(asset.priceUSD!)}
+          <div className="mt-1 space-y-0.5 min-w-0">
+            <p
+              className={`font-bold font-mono ${marketStyle.price} leading-none whitespace-nowrap ${usdPriceSizeClass}`}
+            >
+              {usdPriceText}
             </p>
-            <p className="text-[11px] font-mono text-slate-500 leading-none">
-              {formatCommas(priceKrw)}원
+            <p
+              className={`font-mono text-slate-500 leading-none whitespace-nowrap ${krwPriceSizeClass}`}
+            >
+              {krwPriceText}
             </p>
           </div>
         ) : (
-          <p className={`text-[15px] font-bold font-mono ${marketStyle.price} leading-none mt-1`}>
-            {formatCommas(priceKrw)}원
+          <p
+            className={`font-bold font-mono ${marketStyle.price} leading-none mt-1 whitespace-nowrap ${krwPriceSizeClass}`}
+          >
+            {krwPriceText}
           </p>
         )}
       </div>
@@ -693,77 +748,19 @@ export const RecommendedAssetsSection: React.FC<RecommendedAssetsSectionProps> =
     setSelectedAsset(null);
   };
 
+  const assetGridRowClass = activeTab === 'custom' ? 'row-start-3' : 'row-start-5';
+
   return (
     <>
       <div
         className="bg-emerald-50/40 border border-emerald-200 rounded-xl p-3 sm:p-4 space-y-2.5"
         data-logical-name="tradingSystemPhase5"
       >
-        <div className="flex items-center justify-between gap-2 flex-wrap">
-          <h3 className="text-xs font-extrabold text-emerald-900 flex items-center gap-1.5">
-            <Layers className="w-3.5 h-3.5 text-emerald-600" />
+        <div className="grid grid-cols-[auto_minmax(7.5rem,13rem)_1fr] gap-x-2 gap-y-2 items-center">
+          <h3 className="col-start-1 row-start-1 text-xs font-extrabold text-emerald-900 flex items-center gap-1.5 shrink-0 whitespace-nowrap">
+            <Layers className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
             모의 자산 간편 선택
           </h3>
-          <div className="flex flex-wrap items-center gap-2 text-[9px] font-bold text-slate-500 shrink-0">
-            <span className="inline-flex items-center gap-1">
-              <span className="w-2.5 h-2.5 rounded-sm border border-amber-300 bg-amber-50" />
-              국내
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <span className="w-2.5 h-2.5 rounded-sm border border-blue-300 bg-blue-50" />
-              미국
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <span className="w-2.5 h-2.5 rounded-sm border border-purple-300 bg-purple-50" />
-              암호화폐
-            </span>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 sm:grid-cols-[1fr_minmax(220px,320px)] gap-2 items-start">
-          <div className="flex flex-col gap-1.5 self-center">
-            <div className="flex flex-wrap gap-1">
-              {tabs.map((tab) => (
-                <button
-                  key={tab.key}
-                  type="button"
-                  onClick={() => setActiveTab(tab.key)}
-                  className={`px-2 py-1 text-[10px] font-bold rounded-md border transition cursor-pointer ${
-                    activeTab === tab.key
-                      ? 'bg-white text-emerald-800 border-emerald-300 shadow-sm'
-                      : 'bg-transparent text-slate-500 border-transparent hover:bg-white/60 hover:text-slate-700'
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
-            {activeTab !== 'custom' && (
-              <div className="flex flex-wrap items-center gap-1">
-                <span className="text-[9px] font-bold text-slate-400 mr-0.5">정렬</span>
-                {(
-                  [
-                    { key: 'name-asc' as const, label: '가나다순' },
-                    { key: 'price-desc' as const, label: '가격 높은순' },
-                    { key: 'price-asc' as const, label: '가격 낮은순' },
-                  ] as const
-                ).map((option) => (
-                  <button
-                    key={option.key}
-                    type="button"
-                    onClick={() => setSortOrder(option.key)}
-                    className={`px-2 py-0.5 text-[9px] font-bold rounded-md border transition cursor-pointer ${
-                      sortOrder === option.key
-                        ? 'bg-slate-800 text-white border-slate-800'
-                        : 'bg-white text-slate-500 border-slate-200 hover:border-slate-300'
-                    }`}
-                  >
-                    {option.label}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
 
           <AssetSearchAndAdd
             embedded
@@ -777,28 +774,88 @@ export const RecommendedAssetsSection: React.FC<RecommendedAssetsSectionProps> =
             onOpenCustomAssetModal={onOpenCustomAssetModal}
             exchangeRate={exchangeRate}
           />
-        </div>
 
-        {visibleAssets.length === 0 ? (
-          <p className="text-[11px] text-slate-500 py-4 text-center">
-            {activeTab === 'custom'
-              ? '참여자가 추가한 자산이 없습니다.'
-              : '표시할 자산이 없습니다.'}
-          </p>
-        ) : (
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-            {visibleAssets.map((asset) => (
-              <CompactAssetCard
-                key={`${activeTab}-${asset.id}`}
-                asset={asset}
-                exchangeRate={exchangeRate}
-                marketPrices={marketPrices}
-                catalogPrices={catalogPrices}
-                onAdd={setSelectedAsset}
-              />
+          <div className="col-start-3 row-start-1 flex items-center justify-end gap-2 shrink-0 whitespace-nowrap text-[8px] sm:text-[9px] font-bold text-slate-500 ml-auto">
+            <span className="inline-flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-sm border border-amber-300 bg-amber-50 shrink-0" />
+              국내
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-sm border border-blue-300 bg-blue-50 shrink-0" />
+              미국
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-sm border border-purple-300 bg-purple-50 shrink-0" />
+              암호화폐
+            </span>
+          </div>
+
+          <div className="col-span-3 row-start-2 flex flex-nowrap items-center justify-start gap-1 overflow-x-auto scrollbar-none">
+            {tabs.map((tab) => (
+              <button
+                key={tab.key}
+                type="button"
+                onClick={() => setActiveTab(tab.key)}
+                className={`shrink-0 whitespace-nowrap px-2 py-1 text-[9px] sm:text-[10px] font-bold rounded-md border transition cursor-pointer ${
+                  activeTab === tab.key
+                    ? 'bg-white text-emerald-800 border-emerald-300 shadow-sm'
+                    : 'bg-transparent text-slate-500 border-transparent hover:bg-white/60 hover:text-slate-700'
+                }`}
+              >
+                {tab.label}
+              </button>
             ))}
           </div>
-        )}
+
+          {activeTab !== 'custom' && (
+            <div className="col-span-3 row-start-3 flex flex-nowrap items-center justify-start gap-1 overflow-x-auto scrollbar-none">
+              <span className="shrink-0 whitespace-nowrap text-[9px] font-bold text-slate-400 mr-0.5">
+                정렬
+              </span>
+              {(
+                [
+                  { key: 'name-asc' as const, label: '가나다순' },
+                  { key: 'price-desc' as const, label: '가격 높은순' },
+                  { key: 'price-asc' as const, label: '가격 낮은순' },
+                ] as const
+              ).map((option) => (
+                <button
+                  key={option.key}
+                  type="button"
+                  onClick={() => setSortOrder(option.key)}
+                  className={`shrink-0 whitespace-nowrap px-2 py-0.5 text-[9px] font-bold rounded-md border transition cursor-pointer ${
+                    sortOrder === option.key
+                      ? 'bg-slate-800 text-white border-slate-800'
+                      : 'bg-white text-slate-500 border-slate-200 hover:border-slate-300'
+                  }`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {visibleAssets.length === 0 ? (
+            <p className={`col-span-3 ${assetGridRowClass} text-[11px] text-slate-500 py-4 text-center`}>
+              {activeTab === 'custom'
+                ? '참여자가 추가한 자산이 없습니다.'
+                : '표시할 자산이 없습니다.'}
+            </p>
+          ) : (
+            <div className={`col-span-3 ${assetGridRowClass} grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3`}>
+              {visibleAssets.map((asset) => (
+                <CompactAssetCard
+                  key={`${activeTab}-${asset.id}`}
+                  asset={asset}
+                  exchangeRate={exchangeRate}
+                  marketPrices={marketPrices}
+                  catalogPrices={catalogPrices}
+                  onAdd={setSelectedAsset}
+                />
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {selectedAsset && (

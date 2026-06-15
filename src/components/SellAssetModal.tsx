@@ -1,6 +1,14 @@
 import React, { useMemo, useState, useEffect } from 'react';
 import { AssetItem } from '../types';
-import { formatCommas, DEFAULT_EXCHANGE_RATE, getDisplayPrice } from '../utils';
+import {
+  formatCommas,
+  DEFAULT_EXCHANGE_RATE,
+  getDisplayPrice,
+  supportsFractionalQuantity,
+  roundFractionalQuantity,
+  getQuantityUnitLabel,
+  formatQuantityDisplay,
+} from '../utils';
 import { computeSellPreview, getProfitStyle, isUsMarketAsset, CatalogPriceMap } from '../utils/portfolioPnL';
 import { Loader2, X } from 'lucide-react';
 
@@ -25,13 +33,24 @@ export const SellAssetModal: React.FC<SellAssetModalProps> = ({
   onClose,
   onConfirm,
 }) => {
-  const maxQty = Math.floor(asset.quantity);
-  const [quantity, setQuantity] = useState(Math.min(1, maxQty));
+  const fractional = supportsFractionalQuantity(asset);
+  const maxQty = fractional ? asset.quantity : Math.floor(asset.quantity);
+  const unitLabel = getQuantityUnitLabel(asset);
+  const minQty = fractional ? 0.00000001 : 1;
+  const qtyStep = fractional ? 0.00000001 : 1;
+  const qtyDelta = fractional ? 0.001 : 1;
+
+  const [quantity, setQuantity] = useState(
+    fractional ? Math.min(maxQty, 0.001) : Math.min(1, maxQty)
+  );
   const isUs = isUsMarketAsset(asset);
 
   useEffect(() => {
-    setQuantity((prev) => Math.min(maxQty, Math.max(1, prev)));
-  }, [maxQty, asset.name]);
+    setQuantity((prev) => {
+      const next = roundFractionalQuantity(Math.min(maxQty, Math.max(minQty, prev)), asset);
+      return fractional ? next : Math.floor(next);
+    });
+  }, [maxQty, asset.name, fractional, minQty, asset]);
 
   const preview = useMemo(
     () => computeSellPreview(asset, quantity, marketPrices, exchangeRate, currentSavings, catalogPrices),
@@ -39,20 +58,27 @@ export const SellAssetModal: React.FC<SellAssetModalProps> = ({
   );
 
   const profitStyle = getProfitStyle(preview.realizedProfit);
-  const isValid = quantity >= 1 && quantity <= maxQty && Number.isInteger(quantity);
+  const roundedQty = roundFractionalQuantity(quantity, asset);
+  const isValid =
+    roundedQty > 0 &&
+    roundedQty <= maxQty + (fractional ? 1e-8 : 0) &&
+    (fractional || Number.isInteger(roundedQty));
   const purchaseDisplay = getDisplayPrice(asset, preview.purchaseExchangeRate ?? exchangeRate, {
     priceKrw: preview.purchasePriceKrw,
     priceUsd: preview.purchasePriceUsd,
   });
 
   const adjustQuantity = (delta: number) => {
-    setQuantity((prev) => Math.min(maxQty, Math.max(1, prev + delta)));
+    setQuantity((prev) => {
+      const next = roundFractionalQuantity(Math.min(maxQty, Math.max(minQty, prev + delta)), asset);
+      return fractional ? next : Math.floor(next);
+    });
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!isValid || isSubmitting) return;
-    onConfirm(quantity);
+    onConfirm(roundedQty);
   };
 
   return (
@@ -89,40 +115,46 @@ export const SellAssetModal: React.FC<SellAssetModalProps> = ({
             ) : (
               <Row label="현재가" value={`${formatCommas(Math.round(preview.sellPriceKrw))}원`} />
             )}
-            <Row label="보유수량" value={`${maxQty}주`} />
+            <Row label="보유수량" value={`${formatQuantityDisplay(maxQty, asset)}${unitLabel}`} />
             <div className="flex items-center justify-between gap-3 pt-1">
               <span className="text-slate-500 shrink-0">매도수량</span>
               <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => adjustQuantity(-1)}
-                  disabled={quantity <= 1}
+                  onClick={() => adjustQuantity(-qtyDelta)}
+                  disabled={quantity <= minQty}
                   className="w-8 h-8 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 font-bold disabled:opacity-40 cursor-pointer"
                 >
                   ▼
                 </button>
                 <input
                   type="number"
-                  step={1}
-                  min={1}
+                  step={qtyStep}
+                  min={minQty}
                   max={maxQty}
                   value={quantity}
                   onChange={(e) => {
-                    const next = parseInt(e.target.value, 10);
+                    const next = parseFloat(e.target.value);
                     if (Number.isNaN(next)) return;
-                    setQuantity(Math.min(maxQty, Math.max(1, next)));
+                    const clamped = roundFractionalQuantity(
+                      Math.min(maxQty, Math.max(minQty, next)),
+                      asset
+                    );
+                    setQuantity(fractional ? clamped : Math.floor(clamped));
                   }}
-                  className="w-16 text-center text-sm font-mono font-bold px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-100"
+                  className="w-24 text-center text-sm font-mono font-bold px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-100"
                 />
                 <button
                   type="button"
-                  onClick={() => adjustQuantity(1)}
+                  onClick={() => adjustQuantity(qtyDelta)}
                   disabled={quantity >= maxQty}
                   className="w-8 h-8 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 font-bold disabled:opacity-40 cursor-pointer"
                 >
                   ▲
                 </button>
-                <span className="text-xs font-bold text-slate-400">주</span>
+                <span className="text-xs font-bold text-slate-400">
+                  {unitLabel} (최대: {formatQuantityDisplay(maxQty, asset)})
+                </span>
               </div>
             </div>
           </div>

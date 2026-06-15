@@ -24,10 +24,6 @@ export const RECOMMENDED_ASSETS: RecommendedAsset[] = [
   { id: 'rec_005930', name: '삼성전자', ticker: '005930', type: 'stock', market: 'Korea', marketRegion: 'Korea', priceKRW: 322500, displayCurrency: 'KRW' },
   { id: 'rec_005380', name: '현대차', ticker: '005380', type: 'stock', market: 'Korea', marketRegion: 'Korea', priceKRW: 607000, displayCurrency: 'KRW' },
   { id: 'rec_034020', name: '두산에너빌리티', ticker: '034020', type: 'stock', market: 'Korea', marketRegion: 'Korea', priceKRW: 93100, displayCurrency: 'KRW' },
-  { id: 'rec_051910', name: 'LG화학', ticker: '051910', type: 'stock', market: 'Korea', marketRegion: 'Korea', priceKRW: 358000, displayCurrency: 'KRW' },
-  { id: 'rec_035420', name: 'NAVER', ticker: '035420', type: 'stock', market: 'Korea', marketRegion: 'Korea', priceKRW: 212000, displayCurrency: 'KRW' },
-  { id: 'rec_035720', name: '카카오', ticker: '035720', type: 'stock', market: 'Korea', marketRegion: 'Korea', priceKRW: 45800, displayCurrency: 'KRW' },
-  { id: 'rec_068270', name: '셀트리온', ticker: '068270', type: 'stock', market: 'Korea', marketRegion: 'Korea', priceKRW: 189500, displayCurrency: 'KRW' },
 ];
 
 export const DOMESTIC_PRESETS: PresetAsset[] = [
@@ -35,11 +31,8 @@ export const DOMESTIC_PRESETS: PresetAsset[] = [
   { name: '삼성전자', type: 'stock', price: 322500 },
   { name: '현대차', type: 'stock', price: 607000 },
   { name: '두산에너빌리티', type: 'stock', price: 106805 },
-  { name: 'LG화학', type: 'stock', price: 358000 },
-  { name: 'NAVER', type: 'stock', price: 212000 },
-  { name: '카카오', type: 'stock', price: 45800 },
-  { name: '셀트리온', type: 'stock', price: 189500 },
   { name: 'TIGER 반도체TOP10', type: 'etf', price: 53000 },
+  { name: 'TIGER S&P500 ETF', type: 'etf', price: 310000 },
   { name: 'KODEX 미국S&P500', type: 'etf', price: 25420 },
   { name: 'KODEX 미국나스닥100', type: 'etf', price: 29645 },
 ];
@@ -56,6 +49,7 @@ export const FOREIGN_PRESETS: PresetAsset[] = [
   { name: '엔비디아', type: 'stock', price: 307785, usdPrice: 205.19 },
   { name: '팔란티어', type: 'stock', price: 191985, usdPrice: 127.99 },
   { name: 'SPY', type: 'etf', price: 1112625, usdPrice: 741.75 },
+  { name: 'QQQ', type: 'etf', price: 1100000, usdPrice: 733.33, ticker: 'QQQ' },
   { name: 'SCHD', type: 'etf', price: 49230, usdPrice: 32.82 },
   { name: '시놉시스', type: 'stock', price: 680835, usdPrice: 453.89 },
   { name: 'TSMC', type: 'stock', price: 635895, usdPrice: 423.93 },
@@ -98,6 +92,7 @@ export const US_ASSET_ENGLISH_NAMES: Readonly<Record<string, string>> = {
   엔비디아: 'NVIDIA',
   팔란티어: 'Palantir',
   SPY: 'SPY',
+  QQQ: 'QQQ',
   SCHD: 'SCHD',
   시놉시스: 'Synopsys',
   TSMC: 'TSMC',

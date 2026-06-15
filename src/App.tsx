@@ -21,7 +21,7 @@ import { RecommendedAssetsSection } from './components/RecommendedAssetsSection'
 import { BudgetSummaryCard } from './components/BudgetSummaryCard';
 import { SellAssetModal } from './components/SellAssetModal';
 import { TransactionDetailModal } from './components/TransactionDetailModal';
-import { formatCommas, formatKRW, inferAssetMarket, inferAssetSector, enrichAssetCurrencyFields, DEFAULT_EXCHANGE_RATE, getDisplayPrice } from './utils';
+import { formatCommas, formatKRW, inferAssetMarket, inferAssetSector, enrichAssetCurrencyFields, DEFAULT_EXCHANGE_RATE, getDisplayPrice, supportsFractionalQuantity, roundFractionalQuantity, getQuantityUnitLabel, formatQuantityDisplay } from './utils';
 import { computeSellPreview, getProfitStyle, derivePortfolioCash, PORTFOLIO_STARTING_CAPITAL, isUsMarketAsset, buildCatalogPriceMap, getTotalPurchaseAmountKrw } from './utils/portfolioPnL';
 import { getPresetByName } from './presets';
 import { 
@@ -385,9 +385,14 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedSellAsset) return;
-    const maxQty = Math.floor(selectedSellAsset.quantity);
-    setSellQuantity((prev) => Math.min(Math.max(1, prev), maxQty));
-  }, [tradeAssetIndex, selectedSellAsset?.quantity, selectedSellAsset?.name]);
+    const fractional = supportsFractionalQuantity(selectedSellAsset);
+    const maxQty = fractional ? selectedSellAsset.quantity : Math.floor(selectedSellAsset.quantity);
+    const minQty = fractional ? 0.00000001 : 1;
+    setSellQuantity((prev) => {
+      const next = roundFractionalQuantity(Math.min(Math.max(minQty, prev), maxQty), selectedSellAsset);
+      return fractional ? next : Math.floor(next);
+    });
+  }, [tradeAssetIndex, selectedSellAsset?.quantity, selectedSellAsset?.name, selectedSellAsset]);
 
   const portfolioValues = useMemo(
     () =>
@@ -727,12 +732,6 @@ export default function App() {
       return false;
     }
 
-    const integerQty = Math.floor(qty);
-    if (!Number.isInteger(integerQty) || integerQty <= 0) {
-      setTradeMsg({ type: 'error', text: '매도 수량은 1 이상의 정수여야 합니다.' });
-      return false;
-    }
-
     const trimmedName = assetName.trim();
     const held = assets.find((a) => a.name.trim() === trimmedName);
     if (!held) {
@@ -740,9 +739,20 @@ export default function App() {
       return false;
     }
 
+    const fractional = supportsFractionalQuantity(held);
+    const sellQty = roundFractionalQuantity(qty, held);
+    if (!Number.isFinite(sellQty) || sellQty <= 0) {
+      setTradeMsg({ type: 'error', text: '매도 수량은 0보다 커야 합니다.' });
+      return false;
+    }
+    if (!fractional && (!Number.isInteger(sellQty) || sellQty <= 0)) {
+      setTradeMsg({ type: 'error', text: '매도 수량은 1 이상의 정수여야 합니다.' });
+      return false;
+    }
+
     const sellPrice = computeSellPreview(
       held,
-      integerQty,
+      sellQty,
       marketPrices,
       effectiveExchangeRate,
       savings,
@@ -753,7 +763,7 @@ export default function App() {
     try {
       const result = await sellAsset(nickname, {
         assetName: trimmedName,
-        quantity: integerQty,
+        quantity: sellQty,
         sellPriceKrw: sellPrice,
       });
 
@@ -761,7 +771,7 @@ export default function App() {
       setCumulativeRealizedProfit(result.newCumulativeRealizedProfit);
       setCashBalance(result.newSavings);
       portfolioHydratedFor.current = nickname;
-      setSellQuantity(1);
+      setSellQuantity(supportsFractionalQuantity(held) ? 0.001 : 1);
 
       setTradeMsg({
         type: 'success',
@@ -932,8 +942,17 @@ export default function App() {
 
   const adjustSellQuantity = (delta: number) => {
     if (!selectedSellAsset) return;
-    const maxQty = Math.floor(selectedSellAsset.quantity);
-    setSellQuantity((prev) => Math.min(maxQty, Math.max(1, prev + delta)));
+    const fractional = supportsFractionalQuantity(selectedSellAsset);
+    const maxQty = fractional ? selectedSellAsset.quantity : Math.floor(selectedSellAsset.quantity);
+    const minQty = fractional ? 0.00000001 : 1;
+    const qtyDelta = fractional ? 0.001 : 1;
+    setSellQuantity((prev) => {
+      const next = roundFractionalQuantity(
+        Math.min(maxQty, Math.max(minQty, prev + delta * qtyDelta)),
+        selectedSellAsset
+      );
+      return fractional ? next : Math.floor(next);
+    });
   };
 
   const handleTransactionSearch = () => {
@@ -1604,11 +1623,15 @@ export default function App() {
                           onChange={(e) => setTradeAssetIndex(Number(e.target.value))}
                           className="w-full bg-slate-50 border border-slate-250 focus:border-indigo-400 rounded-xl py-2.5 px-3 text-sm text-slate-800 outline-none transition font-bold cursor-pointer"
                         >
-                          {heldAssets.map((asset, index) => (
-                            <option key={`${asset.name}-${index}`} value={index}>
-                              {asset.name} (보유: {Math.floor(asset.quantity)}주)
-                            </option>
-                          ))}
+                          {heldAssets.map((asset, index) => {
+                            const unit = getQuantityUnitLabel(asset);
+                            const qtyLabel = formatQuantityDisplay(asset.quantity, asset);
+                            return (
+                              <option key={`${asset.name}-${index}`} value={index}>
+                                {asset.name} (보유: {qtyLabel}{unit})
+                              </option>
+                            );
+                          })}
                         </select>
                       </div>
 
@@ -1637,43 +1660,61 @@ export default function App() {
                             ) : (
                               <InfoRow label="현재가" value={`${formatCommas(Math.round(sellPreview.sellPriceKrw))}원`} />
                             )}
-                            <InfoRow label="보유수량" value={`${Math.floor(selectedSellAsset.quantity)}주`} />
+                            <InfoRow
+                              label="보유수량"
+                              value={`${formatQuantityDisplay(selectedSellAsset.quantity, selectedSellAsset)}${getQuantityUnitLabel(selectedSellAsset)}`}
+                            />
                             <div className="flex items-center justify-between gap-3 pt-1">
                               <span className="text-slate-500 shrink-0">매도수량</span>
                               <div className="flex items-center gap-2">
+                                {(() => {
+                                  const fractional = supportsFractionalQuantity(selectedSellAsset);
+                                  const maxQty = fractional
+                                    ? selectedSellAsset.quantity
+                                    : Math.floor(selectedSellAsset.quantity);
+                                  const minQty = fractional ? 0.00000001 : 1;
+                                  const unit = getQuantityUnitLabel(selectedSellAsset);
+                                  return (
+                                    <>
                                 <button
                                   type="button"
                                   onClick={() => adjustSellQuantity(-1)}
-                                  disabled={sellQuantity <= 1}
+                                  disabled={sellQuantity <= minQty}
                                   className="w-8 h-8 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-bold disabled:opacity-40 cursor-pointer disabled:cursor-not-allowed"
                                 >
                                   ▼
                                 </button>
                                 <input
                                   type="number"
-                                  step={1}
-                                  min={1}
-                                  max={Math.floor(selectedSellAsset.quantity)}
+                                  step={fractional ? 0.00000001 : 1}
+                                  min={minQty}
+                                  max={maxQty}
                                   value={sellQuantity}
                                   onChange={(e) => {
-                                    const next = parseInt(e.target.value, 10);
+                                    const next = parseFloat(e.target.value);
                                     if (Number.isNaN(next)) return;
-                                    const maxQty = Math.floor(selectedSellAsset.quantity);
-                                    setSellQuantity(Math.min(maxQty, Math.max(1, next)));
+                                    const clamped = roundFractionalQuantity(
+                                      Math.min(maxQty, Math.max(minQty, next)),
+                                      selectedSellAsset
+                                    );
+                                    setSellQuantity(fractional ? clamped : Math.floor(clamped));
                                   }}
-                                  className="w-16 text-center text-sm font-mono font-bold px-2 py-1.5 bg-white border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-400"
+                                  className="w-24 text-center text-sm font-mono font-bold px-2 py-1.5 bg-white border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-400"
                                 />
                                 <button
                                   type="button"
                                   onClick={() => adjustSellQuantity(1)}
-                                  disabled={sellQuantity >= Math.floor(selectedSellAsset.quantity)}
+                                  disabled={sellQuantity >= maxQty}
                                   className="w-8 h-8 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 font-bold disabled:opacity-40 cursor-pointer disabled:cursor-not-allowed"
                                 >
                                   ▲
                                 </button>
                                 <span className="text-xs font-bold text-slate-500">
-                                  주 (최대: {Math.floor(selectedSellAsset.quantity)}주)
+                                  {unit} (최대: {formatQuantityDisplay(maxQty, selectedSellAsset)})
                                 </span>
+                                    </>
+                                  );
+                                })()}
                               </div>
                             </div>
                           </div>

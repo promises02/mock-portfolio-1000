@@ -395,6 +395,11 @@ async function startServer() {
       sourceUrl: 'https://finance.naver.com/item/main.naver?code=SPY',
       reasoning: '미국 ETF SPY 설정 시세 $741.75 (1달러당 1,500원 원화 계산 적용).'
     },
+    'qqq': {
+      currentPrice: 1100000,
+      sourceUrl: 'https://finance.yahoo.com/quote/QQQ',
+      reasoning: '미국 ETF QQQ 설정 시세 $733.33 (1달러당 1,500원 원화 계산 적용).'
+    },
     'schd': {
       currentPrice: 49230,
       sourceUrl: 'https://finance.naver.com/item/main.naver?code=SCHD',

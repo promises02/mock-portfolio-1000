@@ -1,6 +1,6 @@
 import { AssetItem, CustomAsset, Portfolio } from '../types';
 import { RECOMMENDED_ASSETS, ALL_PRESETS, getPresetByName } from '../presets';
-import { DEFAULT_EXCHANGE_RATE, getAssetYieldPercent, inferAssetMarketRegion } from '../utils';
+import { DEFAULT_EXCHANGE_RATE, getAssetYieldPercent, inferAssetMarketRegion, supportsFractionalQuantity, roundFractionalQuantity } from '../utils';
 
 /** 미국 주식: 모의투자 환율 1,500원 고정 (표시·손익 계산 공통) */
 export const US_STOCK_FIXED_EXCHANGE_RATE = DEFAULT_EXCHANGE_RATE;
@@ -465,7 +465,10 @@ export function computeSellPreview(
   const normalized = isUsMarketAsset(asset)
     ? normalizeUsAssetPurchaseBasis(asset, exchangeRate)
     : asset;
-  const qty = Math.max(0, Math.floor(sellQuantity));
+  const fractional = supportsFractionalQuantity(normalized);
+  const qty = fractional
+    ? Math.max(0, roundFractionalQuantity(sellQuantity, normalized))
+    : Math.max(0, Math.floor(sellQuantity));
 
   if (isUsMarketAsset(normalized)) {
     const rate = exchangeRate;

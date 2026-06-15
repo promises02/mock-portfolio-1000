@@ -53,26 +53,15 @@ export const ASSET_PRICE_REGISTRY: AssetPriceConfig[] = [
     yahooSymbol: '034020.KS',
     aliases: ['doosan'],
   }),
-  entry('LG화학', 'kr', 358000, 'https://finance.naver.com/item/main.naver?code=051910', {
-    naverCode: '051910',
-    yahooSymbol: '051910.KS',
-  }),
-  entry('NAVER', 'kr', 212000, 'https://finance.naver.com/item/main.naver?code=035420', {
-    naverCode: '035420',
-    yahooSymbol: '035420.KS',
-  }),
-  entry('카카오', 'kr', 45800, 'https://finance.naver.com/item/main.naver?code=035720', {
-    naverCode: '035720',
-    yahooSymbol: '035720.KS',
-  }),
-  entry('셀트리온', 'kr', 189500, 'https://finance.naver.com/item/main.naver?code=068270', {
-    naverCode: '068270',
-    yahooSymbol: '068270.KS',
-  }),
   entry('TIGER 반도체TOP10', 'kr', 53000, 'https://finance.naver.com/item/main.naver?code=396500', {
     naverCode: '396500',
     yahooSymbol: '396500.KS',
     aliases: ['tiger반도체top10', 'tiger반도체탑10', 'tiger반도체'],
+  }),
+  entry('TIGER S&P500 ETF', 'kr', 310000, 'https://finance.naver.com/item/main.naver?code=360750', {
+    naverCode: '360750',
+    yahooSymbol: '360750.KS',
+    aliases: ['tigers&p500etf', 'tiger s&p500'],
   }),
   entry('KODEX 미국S&P500', 'kr', 25420, 'https://finance.naver.com/item/main.naver?code=409820', {
     naverCode: '409820',
@@ -124,6 +113,10 @@ export const ASSET_PRICE_REGISTRY: AssetPriceConfig[] = [
     aliases: ['palantir'],
   }),
   entry('SPY', 'us', 1112625, 'https://finance.yahoo.com/quote/SPY', { yahooSymbol: 'SPY' }),
+  entry('QQQ', 'us', 1100000, 'https://finance.yahoo.com/quote/QQQ', {
+    yahooSymbol: 'QQQ',
+    aliases: ['qqq', '나스닥100', '나스닥100etf', 'qqq(나스닥100etf)'],
+  }),
   entry('SCHD', 'us', 49230, 'https://finance.yahoo.com/quote/SCHD', { yahooSymbol: 'SCHD' }),
   entry('시놉시스', 'us', 680835, 'https://finance.yahoo.com/quote/SNPS', {
     yahooSymbol: 'SNPS',

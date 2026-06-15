@@ -248,7 +248,7 @@ export const CustomAssetModal: React.FC<CustomAssetModalProps> = ({
               type="text"
               value={assetName}
               onChange={(e) => setAssetName(e.target.value)}
-              placeholder="예: 카카오, TSLA"
+              placeholder="예: 삼성전자, TSLA"
               disabled={isBusy}
               className="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 rounded-xl text-sm outline-none transition disabled:opacity-60"
             />

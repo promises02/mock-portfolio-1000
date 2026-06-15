@@ -109,6 +109,47 @@ export function getDefaultDisplayCurrency(market: AssetMarket): DisplayCurrency 
   return 'KRW';
 }
 
+export function isCryptoMarketAsset(
+  asset: Pick<AssetItem, 'name' | 'type' | 'market'>
+): boolean {
+  return (asset.market ?? inferAssetMarketRegion(asset.name, asset.type || 'stock')) === 'Crypto';
+}
+
+/** 암호화폐(비트코인 등) — 소수점 수량 매수·매도 허용 */
+export function supportsFractionalQuantity(
+  asset: Pick<AssetItem, 'name' | 'type' | 'market'>
+): boolean {
+  return isCryptoMarketAsset(asset);
+}
+
+export function roundFractionalQuantity(
+  quantity: number,
+  asset: Pick<AssetItem, 'name' | 'type' | 'market'>
+): number {
+  if (!Number.isFinite(quantity) || quantity <= 0) return 0;
+  if (supportsFractionalQuantity(asset)) {
+    return Math.round(quantity * 1e8) / 1e8;
+  }
+  return Math.floor(quantity);
+}
+
+export function getQuantityUnitLabel(
+  asset: Pick<AssetItem, 'name' | 'type' | 'market'>
+): string {
+  return supportsFractionalQuantity(asset) ? '개' : '주';
+}
+
+export function formatQuantityDisplay(
+  quantity: number,
+  asset: Pick<AssetItem, 'name' | 'type' | 'market'>
+): string {
+  if (supportsFractionalQuantity(asset)) {
+    const rounded = roundFractionalQuantity(quantity, asset);
+    return rounded.toFixed(8).replace(/\.?0+$/, '');
+  }
+  return String(Math.floor(quantity));
+}
+
 export function resolveDisplayCurrency(asset: AssetItem): DisplayCurrency {
   if (asset.displayCurrency) return asset.displayCurrency;
   const market = asset.market ?? inferAssetMarketRegion(asset.name, asset.type || 'stock');
@@ -547,6 +588,19 @@ export function inferAssetSector(name: string, type: string): string {
   }
   if (norm.includes('비트코인') || norm.includes('bitcoin') || norm.includes('btc') || norm.includes('이더리움') || norm.includes('ethereum') || norm.includes('eth') || norm.includes('코인') || norm.includes('crypto')) {
     return '암호화폐';
+  }
+  if (norm.includes('schd') || norm.includes('jepi') || norm.includes('배당') || norm.includes('dividend')) {
+    return '배당 ETF';
+  }
+  if (
+    norm.includes('qqq') ||
+    norm.includes('나스닥100') ||
+    norm.includes('spy') ||
+    norm.includes('voo') ||
+    norm.includes('s&p500') ||
+    norm.includes('지수')
+  ) {
+    return '미국자수 ETF';
   }
 
   // Broad fallbacks by type

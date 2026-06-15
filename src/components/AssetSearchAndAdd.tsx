@@ -265,6 +265,14 @@ export const AssetSearchAndAdd: React.FC<AssetSearchAndAddProps> = ({
     ? 'contents'
     : 'bg-emerald-50/60 border-2 border-emerald-200 rounded-2xl p-5 sm:p-6 space-y-4 shadow-sm';
 
+  const searchWrapperClassName = embedded
+    ? 'relative w-full min-w-0 col-start-2 row-start-1 max-w-[11rem] sm:max-w-[13rem] justify-self-start self-center'
+    : 'relative w-full';
+
+  const searchInputClassName = embedded
+    ? 'py-1.5 text-[10px] pl-7 pr-2 leading-tight'
+    : 'py-3 text-sm rounded-xl pl-10 pr-4';
+
   return (
     <div ref={containerRef} data-logical-name="assetSearchAndAdd" className={rootClassName}>
       {!embedded && (
@@ -279,12 +287,16 @@ export const AssetSearchAndAdd: React.FC<AssetSearchAndAddProps> = ({
         </div>
       )}
 
-      <div className={`relative w-full ${embedded ? 'sm:justify-self-end' : ''}`}>
+      <div className={searchWrapperClassName}>
         <label htmlFor="asset-search-input" className="sr-only">
           자산 검색 및 매수
         </label>
         <div className="relative">
-          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-emerald-500" />
+          <Search
+            className={`absolute left-2 top-1/2 -translate-y-1/2 text-emerald-500 ${
+              embedded ? 'w-3 h-3' : 'w-3.5 h-3.5 left-2.5'
+            }`}
+          />
           <input
             id="asset-search-input"
             type="text"
@@ -294,10 +306,8 @@ export const AssetSearchAndAdd: React.FC<AssetSearchAndAddProps> = ({
               setShowDropdown(true);
             }}
             onFocus={() => setShowDropdown(true)}
-            placeholder={embedded ? '자산 검색 (삼성, AAPL 등)' : '자산명 입력 (삼성, AAPL, 비트코인 등)'}
-            className={`w-full pl-8 pr-3 bg-white border border-emerald-200 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 rounded-lg text-slate-800 placeholder-slate-400 outline-none transition font-semibold ${
-              embedded ? 'py-2 text-xs' : 'py-3 text-sm rounded-xl pl-10 pr-4'
-            }`}
+            placeholder={embedded ? '자산 검색 (삼성, AAPL)' : '자산명 입력 (삼성, AAPL, 비트코인 등)'}
+            className={`w-full bg-white border border-emerald-200 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 rounded-lg text-slate-800 placeholder-slate-400 outline-none transition font-semibold ${searchInputClassName}`}
           />
         </div>
 
@@ -377,7 +387,7 @@ export const AssetSearchAndAdd: React.FC<AssetSearchAndAddProps> = ({
       </div>
 
       {(message || pendingCards.length > 0) && (
-        <div className={`space-y-3 ${embedded ? 'col-span-full' : ''}`}>
+        <div className={`space-y-3 ${embedded ? 'col-span-3 row-start-4' : ''}`}>
       {message && (
         <div
           className={`px-4 py-2.5 rounded-xl text-xs font-bold border ${

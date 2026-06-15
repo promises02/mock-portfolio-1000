@@ -3,6 +3,7 @@
 interface ImportMetaEnv {
   readonly VITE_GOOGLE_GEMINI_API_KEY?: string;
   readonly VITE_ADMIN_PASSWORD?: string;
+  readonly VITE_USE_FIREBASE_EMULATOR?: string;
 }
 
 interface ImportMeta {
@@ -30,4 +31,10 @@ interface Window {
   }>;
   recalculateAllPortfolios?: () => Promise<{ portfolioCount: number }>;
   fixMicronTeslaMarketRegionInFirestore?: () => Promise<{ updated: string[] }>;
+  seedInitialPortfolios20260529?: () => Promise<{
+    success: boolean;
+    message: string;
+    logicalName: string;
+    seededNicknames: string[];
+  }>;
 }

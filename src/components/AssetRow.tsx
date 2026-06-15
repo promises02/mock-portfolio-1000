@@ -164,6 +164,7 @@ export const AssetRow: React.FC<AssetRowProps> = ({
               <option value="엔비디아" />
               <option value="팔란티어" />
               <option value="SPY" />
+              <option value="QQQ" />
               <option value="SCHD" />
               <option value="시놉시스" />
               <option value="TSMC" />

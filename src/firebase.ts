@@ -10,11 +10,12 @@ import {
   query,
   where,
   getFirestore,
+  connectFirestoreEmulator,
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 import { ALL_PRESETS, FOREIGN_PRESETS, getPresetByName } from './presets';
 import { AssetType, AssetMarket, CustomAsset, DisplayCurrency, Portfolio, ValidationResult, BuyRequest, AssetItem, Transaction, TransactionStats, TransactionPeriodFilter, TransactionListFilters, TransactionMonthlyStat, TransactionDetailRow, BuyAssetError, SellAssetError, SellAssetRequest, SellAssetResult, RealtimePriceQuote, RealtimePriceSnapshot, MarketPriceMap, AdminPriceUpdateReason, AdminExchangeRateUpdateReason, AdminPriceUpdateResult, PurchaseRecord } from './types';
-import { DEFAULT_EXCHANGE_RATE, computeKrwEquivalent, getDefaultDisplayCurrency, inferAssetMarketRegion, enrichAssetCurrencyFields, inferAssetMarket, inferAssetSector, formatCommas } from './utils';
+import { DEFAULT_EXCHANGE_RATE, computeKrwEquivalent, getDefaultDisplayCurrency, inferAssetMarketRegion, enrichAssetCurrencyFields, inferAssetMarket, inferAssetSector, formatCommas, supportsFractionalQuantity, roundFractionalQuantity } from './utils';
 import {
   derivePortfolioCash,
   getPurchaseUnitKrw,
@@ -43,6 +44,31 @@ async function getGeminiClient() {
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId); /* CRITICAL: The app will break without this line */
+
+// 🔧 로컬 개발·에뮬레이터 — Firestore 권한 문제 회피
+function shouldUseFirestoreEmulator(): boolean {
+  // Vite 브라우저: process 미정의 — import.meta.env만 사용
+  if (typeof import.meta !== 'undefined' && import.meta.env?.DEV) {
+    return import.meta.env.VITE_USE_FIREBASE_EMULATOR === '1';
+  }
+  if (typeof process !== 'undefined' && process.env) {
+    if (process.env.FIRESTORE_EMULATOR_HOST) return true;
+    if (process.env.USE_FIREBASE_EMULATOR === '1') return true;
+    return process.env.NODE_ENV === 'development';
+  }
+  return false;
+}
+
+if (shouldUseFirestoreEmulator()) {
+  try {
+    connectFirestoreEmulator(db, 'localhost', 8080);
+    console.log('✅ Firebase 에뮬레이터 연결 성공');
+  } catch (error) {
+    if (!String(error).includes('already exists')) {
+      console.warn('⚠️ Firebase 에뮬레이터 사용 안 함 (프로덕션 환경)');
+    }
+  }
+}
 
 export interface UnifiedAsset {
   name: string;
@@ -872,10 +898,19 @@ export async function buyAsset(nickname: string, request: BuyRequest): Promise<v
   const preset = getPresetByName(trimmedName.toLowerCase());
   const inferredType = preset?.type ?? 'stock';
   const inferredRegion = inferAssetMarketRegion(trimmedName, inferredType);
+  const isCryptoBuy = inferredRegion === 'Crypto';
   const isUsBuy = displayCurrency === 'USD' || inferredRegion === 'US';
+  const assetRef = { name: trimmedName, type: inferredType, market: inferredRegion };
+  const normalizedQty = roundFractionalQuantity(quantity, assetRef);
+  if (normalizedQty <= 0) {
+    throw new BuyAssetError('수량은 0보다 커야 합니다.');
+  }
+  if (!isCryptoBuy && !Number.isInteger(normalizedQty)) {
+    throw new BuyAssetError('주식·ETF 수량은 1 이상의 정수여야 합니다.');
+  }
   const { priceUsd, priceKrw, amountInKrw } = resolveUsBuyAmounts(
     pricePerUnit,
-    quantity,
+    normalizedQty,
     totalAmount,
     displayCurrency,
     rate,
@@ -883,7 +918,7 @@ export async function buyAsset(nickname: string, request: BuyRequest): Promise<v
   );
 
   if (!isUsBuy) {
-    const expectedTotal = Math.round(pricePerUnit * quantity);
+    const expectedTotal = Math.round(pricePerUnit * normalizedQty);
     if (Math.abs(expectedTotal - totalAmount) > 1) {
       console.warn('[buyAsset] totalAmount mismatch', { expectedTotal, totalAmount });
     }
@@ -916,7 +951,7 @@ export async function buyAsset(nickname: string, request: BuyRequest): Promise<v
 
   const buyRecord = createBuyPurchaseRecord({
     assetId: assetId.trim(),
-    quantity,
+    quantity: normalizedQty,
     pricePerUnit: isUsBuy ? priceUsd : priceKrw,
     amountInKrw,
     isUsBuy,
@@ -927,7 +962,7 @@ export async function buyAsset(nickname: string, request: BuyRequest): Promise<v
   if (existingIndex >= 0) {
     const existing = currentAssets[existingIndex];
     if (isUsBuy) {
-      const merged = mergeUsAssetOnBuy(existing, quantity, priceKrw, priceUsd, rate);
+      const merged = mergeUsAssetOnBuy(existing, normalizedQty, priceKrw, priceUsd, rate);
       nextAssets = currentAssets.map((asset, index) =>
         index === existingIndex
           ? stripUndefinedDeep({
@@ -940,11 +975,14 @@ export async function buyAsset(nickname: string, request: BuyRequest): Promise<v
           : stripUndefinedDeep(asset)
       );
     } else {
-      const newQty = existing.quantity + quantity;
+      const newQty = roundFractionalQuantity(existing.quantity + normalizedQty, assetRef);
       const newAvgPrice = Math.round(
-        (existing.price * existing.quantity + priceKrw * quantity) / newQty
+        (existing.price * existing.quantity + priceKrw * normalizedQty) / newQty
       );
-      const totalPurchaseAmount = Math.round(newAvgPrice * newQty);
+      const totalPurchaseAmount = isCryptoBuy
+        ? Math.round(existing.totalPurchaseAmount ?? existing.price * existing.quantity) +
+          amountInKrw
+        : Math.round(newAvgPrice * newQty);
       nextAssets = currentAssets.map((asset, index) =>
         index === existingIndex
           ? stripUndefinedDeep({
@@ -955,20 +993,21 @@ export async function buyAsset(nickname: string, request: BuyRequest): Promise<v
               currentPrice: priceKrw,
               totalPurchaseAmount,
               priceKRW: pricePerUnit,
-              displayCurrency: 'KRW' as const,
+              displayCurrency: isCryptoBuy ? ('CRYPTO' as const) : ('KRW' as const),
+              market: isCryptoBuy ? ('Crypto' as AssetMarket) : asset.market,
               purchaseHistory: [...(existing.purchaseHistory ?? []), buyRecord],
             })
           : stripUndefinedDeep(asset)
       );
     }
   } else if (isUsBuy) {
-    const usFields = buildUsAssetOnFirstBuy(priceKrw, priceUsd, rate, quantity);
+    const usFields = buildUsAssetOnFirstBuy(priceKrw, priceUsd, rate, normalizedQty);
     nextAssets = [
       ...currentAssets.map((asset) => stripUndefinedDeep(asset)),
       stripUndefinedDeep({
         name: trimmedName,
         type: inferredType,
-        quantity,
+        quantity: normalizedQty,
         market: 'US' as AssetMarket,
         displayCurrency: 'USD' as const,
         marketGroup: inferAssetMarket(trimmedName, inferredType),
@@ -986,12 +1025,12 @@ export async function buyAsset(nickname: string, request: BuyRequest): Promise<v
             name: trimmedName,
             type: inferredType,
             price: priceKrw,
-            quantity,
+            quantity: normalizedQty,
             averagePurchasePrice: priceKrw,
             currentPrice: priceKrw,
             totalPurchaseAmount: amountInKrw,
             market: inferredRegion,
-            displayCurrency: 'KRW' as const,
+            displayCurrency: isCryptoBuy ? ('CRYPTO' as const) : ('KRW' as const),
             priceKRW: pricePerUnit,
             marketGroup: inferAssetMarket(trimmedName, inferredType),
             sector: inferAssetSector(trimmedName, inferredType),
@@ -1815,7 +1854,10 @@ export function computeRealizedProfitOnSell(
   exchangeRate: number
 ): RealizedProfitOnSell {
   const market = asset.market ?? inferAssetMarketRegion(asset.name, asset.type || 'stock');
-  const qty = Math.max(0, Math.floor(sellQuantity));
+  const fractional = market === 'Crypto';
+  const qty = fractional
+    ? Math.max(0, roundFractionalQuantity(sellQuantity, { name: asset.name, type: asset.type || 'crypto', market: 'Crypto' }))
+    : Math.max(0, Math.floor(sellQuantity));
 
   if (market === 'US') {
     const purchasePriceKrw = getPurchaseUnitKrw(asset, exchangeRate);
@@ -2076,14 +2118,10 @@ export async function sellAsset(
 ): Promise<SellAssetResult> {
   const trimmedNickname = nickname.trim();
   const trimmedName = request.assetName.trim();
-  const quantity = Math.floor(request.quantity);
   const sellPriceKrw = Math.round(request.sellPriceKrw);
 
   if (!trimmedNickname) throw new SellAssetError('닉네임이 필요합니다.');
   if (!trimmedName) throw new SellAssetError('매도할 종목을 선택해 주세요.');
-  if (!Number.isInteger(quantity) || quantity <= 0) {
-    throw new SellAssetError('매도 수량은 1 이상의 정수여야 합니다.');
-  }
   if (!Number.isFinite(sellPriceKrw) || sellPriceKrw <= 0) {
     throw new SellAssetError('현재가 정보가 유효하지 않습니다.');
   }
@@ -2111,13 +2149,27 @@ export async function sellAsset(
   }
 
   const existing = currentAssets[assetIndex];
-  const heldQty = Math.floor(existing.quantity);
+  const fractional = supportsFractionalQuantity(existing);
+  const quantity = roundFractionalQuantity(request.quantity, existing);
+
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    throw new SellAssetError(
+      fractional ? '매도 수량은 0보다 커야 합니다.' : '매도 수량은 1 이상의 정수여야 합니다.'
+    );
+  }
+  if (!fractional && !Number.isInteger(quantity)) {
+    throw new SellAssetError('매도 수량은 1 이상의 정수여야 합니다.');
+  }
+
+  const heldQty = fractional ? existing.quantity : Math.floor(existing.quantity);
 
   if (heldQty <= 0) {
     throw new SellAssetError('보유 수량이 없습니다.');
   }
   if (quantity > heldQty) {
-    throw new SellAssetError(`보유 수량(${heldQty}주)을 초과하여 매도할 수 없습니다.`);
+    throw new SellAssetError(
+      `보유 수량(${fractional ? heldQty : Math.floor(heldQty)}${fractional ? '개' : '주'})을 초과하여 매도할 수 없습니다.`
+    );
   }
 
   const exchangeRate = await getGlobalExchangeRate();
@@ -3081,12 +3133,37 @@ const SEED_ASSET_NAME_ALIASES: Record<string, string> = {
   알파벳: '알파벳 Class A',
   하이닉스: 'SK하이닉스',
   MS: '마이크로소프트',
+  '나스닥QQQ': 'QQQ',
+  'SPDR 골드셰어즈 ETF': 'GLD',
 };
 
 interface InitialSeedBuyLine {
   label: string;
   priceKrwPerShare: number;
-  quantity: number;
+  /** 주식·ETF 등 — 정수/소수 수량 */
+  quantity?: number;
+  /** 암호화폐 등 금액 기준 매수 (예: 100만 원어치) */
+  amountKrw?: number;
+}
+
+function resolveSeedBuyQuantity(buy: InitialSeedBuyLine): number {
+  const name = resolveSeedAssetName(buy.label);
+  const preset = getPresetByName(name);
+  const type = (preset?.type ?? 'stock') as AssetType;
+  const assetRef = { name, type, market: inferAssetMarketRegion(name, type) };
+
+  if (buy.quantity != null && buy.quantity > 0) {
+    return roundFractionalQuantity(buy.quantity, assetRef);
+  }
+  if (buy.amountKrw != null && buy.priceKrwPerShare > 0) {
+    return roundFractionalQuantity(buy.amountKrw / buy.priceKrwPerShare, assetRef);
+  }
+  return 0;
+}
+
+function resolveSeedBuyAmountKrw(buy: InitialSeedBuyLine): number {
+  if (buy.amountKrw != null) return Math.round(buy.amountKrw);
+  return Math.round(buy.priceKrwPerShare * resolveSeedBuyQuantity(buy));
 }
 
 interface InitialSeedPortfolioConfig {
@@ -3096,6 +3173,55 @@ interface InitialSeedPortfolioConfig {
 }
 
 const INITIAL_PORTFOLIO_SEED_DATA: InitialSeedPortfolioConfig[] = [
+  {
+    nickname: '이현지',
+    savings: 15_160,
+    buys: [
+      { label: 'SK하이닉스', priceKrwPerShare: 2_350_000, quantity: 1 },
+      { label: '삼성전자', priceKrwPerShare: 318_500, quantity: 5 },
+      { label: '알파벳', priceKrwPerShare: 570_510, quantity: 3 },
+      { label: 'TSMC', priceKrwPerShare: 627_675, quantity: 2 },
+      { label: 'ASML', priceKrwPerShare: 2_419_500, quantity: 1 },
+      { label: '아마존', priceKrwPerShare: 405_960, quantity: 1 },
+      { label: 'KODEX 미국나스닥100', priceKrwPerShare: 30_250, quantity: 4 },
+      { label: 'KODEX 미국S&P500', priceKrwPerShare: 25_800, quantity: 5 },
+    ],
+  },
+  {
+    nickname: '신윤정',
+    savings: 1_880_520,
+    buys: [
+      { label: '두산에너빌리티', priceKrwPerShare: 106_805, quantity: 10 },
+      { label: '노키아 ADR', priceKrwPerShare: 23_000, quantity: 50 },
+      { label: 'SK하이닉스', priceKrwPerShare: 2_350_000, quantity: 1 },
+      { label: 'SPY', priceKrwPerShare: 1_134_720, quantity: 1 },
+      { label: 'QQQ', priceKrwPerShare: 1_100_000, quantity: 1 },
+      { label: '엔비디아', priceKrwPerShare: 316_710, quantity: 1 },
+      { label: '비트코인', priceKrwPerShare: 162_000_000, amountKrw: 1_000_000 },
+    ],
+  },
+  {
+    nickname: 'AI',
+    savings: 610_940,
+    buys: [
+      { label: '엔비디아', priceKrwPerShare: 316_710, quantity: 7 },
+      { label: '알파벳', priceKrwPerShare: 570_510, quantity: 3 },
+      { label: '아마존', priceKrwPerShare: 405_960, quantity: 4 },
+      { label: '메타', priceKrwPerShare: 948_765, quantity: 2 },
+      { label: 'TSMC', priceKrwPerShare: 627_675, quantity: 2 },
+      { label: '브룩필드', priceKrwPerShare: 68_385, quantity: 10 },
+    ],
+  },
+  {
+    nickname: '강은지',
+    savings: 122_235,
+    buys: [
+      { label: 'TIGER S&P500 ETF', priceKrwPerShare: 28_300, quantity: 10 },
+      { label: '나스닥QQQ', priceKrwPerShare: 1_100_000, quantity: 3 },
+      { label: '알파벳', priceKrwPerShare: 570_510, quantity: 5 },
+      { label: 'SPDR 골드셰어즈 ETF', priceKrwPerShare: 625_215, quantity: 1 },
+    ],
+  },
   {
     nickname: '한영준',
     savings: 318_040,
@@ -3111,10 +3237,10 @@ const INITIAL_PORTFOLIO_SEED_DATA: InitialSeedPortfolioConfig[] = [
     buys: [
       { label: '알파벳', priceKrwPerShare: 570_510, quantity: 3 },
       { label: '애플', priceKrwPerShare: 468_090, quantity: 2 },
-      { label: '하이닉스', priceKrwPerShare: 2_350_000, quantity: 1 },
+      { label: 'SK하이닉스', priceKrwPerShare: 2_350_000, quantity: 1 },
       { label: '마이크론', priceKrwPerShare: 1_456_500, quantity: 2 },
       { label: '엔비디아', priceKrwPerShare: 316_710, quantity: 3 },
-      { label: 'MS', priceKrwPerShare: 675_360, quantity: 1 },
+      { label: '마이크로소프트', priceKrwPerShare: 675_360, quantity: 1 },
     ],
   },
   {
@@ -3180,15 +3306,17 @@ function buildInitialSeedAssetItem(buy: InitialSeedBuyLine): AssetItem {
   const preset = getPresetByName(name);
   const type = (preset?.type ?? 'stock') as AssetType;
   const region = inferAssetMarketRegion(name, type);
+  const quantity = resolveSeedBuyQuantity(buy);
+  const amountInKrw = resolveSeedBuyAmountKrw(buy);
   const isUsBuy = region === 'US';
-  const amountInKrw = buy.priceKrwPerShare * buy.quantity;
+  const isCryptoBuy = region === 'Crypto';
   const assetDocId = resolveSeedAssetDocId(name);
 
   if (isUsBuy) {
     const priceUsd = seedUsdFromKrw(buy.priceKrwPerShare);
     const buyRecord = createInitialSeedPurchaseRecord({
       assetDocId,
-      quantity: buy.quantity,
+      quantity,
       pricePerUnit: priceUsd,
       amountInKrw,
       isUsBuy: true,
@@ -3197,12 +3325,12 @@ function buildInitialSeedAssetItem(buy: InitialSeedBuyLine): AssetItem {
       buy.priceKrwPerShare,
       priceUsd,
       INITIAL_SEED_EXCHANGE_RATE,
-      buy.quantity
+      quantity
     );
     return stripUndefinedDeep({
       name,
       type,
-      quantity: buy.quantity,
+      quantity,
       market: 'US' as AssetMarket,
       displayCurrency: 'USD' as DisplayCurrency,
       marketGroup: inferAssetMarket(name, type),
@@ -3212,9 +3340,39 @@ function buildInitialSeedAssetItem(buy: InitialSeedBuyLine): AssetItem {
     });
   }
 
+  if (isCryptoBuy) {
+    const unitKrw = buy.priceKrwPerShare;
+    const buyRecord = createInitialSeedPurchaseRecord({
+      assetDocId,
+      quantity,
+      pricePerUnit: unitKrw,
+      amountInKrw,
+      isUsBuy: false,
+    });
+    return stripUndefinedDeep(
+      enrichAssetCurrencyFields(
+        {
+          name,
+          type,
+          price: unitKrw,
+          quantity,
+          currentPrice: unitKrw,
+          totalPurchaseAmount: amountInKrw,
+          market: 'Crypto' as AssetMarket,
+          displayCurrency: 'CRYPTO' as DisplayCurrency,
+          priceKRW: unitKrw,
+          marketGroup: inferAssetMarket(name, type),
+          sector: inferAssetSector(name, type),
+          purchaseHistory: [buyRecord],
+        },
+        INITIAL_SEED_EXCHANGE_RATE
+      )
+    );
+  }
+
   const buyRecord = createInitialSeedPurchaseRecord({
     assetDocId,
-    quantity: buy.quantity,
+    quantity,
     pricePerUnit: buy.priceKrwPerShare,
     amountInKrw,
     isUsBuy: false,
@@ -3226,7 +3384,7 @@ function buildInitialSeedAssetItem(buy: InitialSeedBuyLine): AssetItem {
         name,
         type,
         price: buy.priceKrwPerShare,
-        quantity: buy.quantity,
+        quantity,
         currentPrice: buy.priceKrwPerShare,
         totalPurchaseAmount: amountInKrw,
         market: region,
@@ -3249,7 +3407,8 @@ function buildInitialSeedTransaction(
   const preset = getPresetByName(name);
   const region = inferAssetMarketRegion(name, preset?.type ?? 'stock');
   const isUsBuy = region === 'US';
-  const amountInKrw = buy.priceKrwPerShare * buy.quantity;
+  const quantity = resolveSeedBuyQuantity(buy);
+  const amountInKrw = resolveSeedBuyAmountKrw(buy);
   const assetDocId = resolveSeedAssetDocId(name);
   const buyRecord = assetItem.purchaseHistory?.[0];
 
@@ -3257,7 +3416,7 @@ function buildInitialSeedTransaction(
     id: buyRecord?.id ?? `initial_20260529_tx_${sanitizeDocId(assetDocId)}`,
     assetName: name,
     type: 'BUY',
-    quantity: buy.quantity,
+    quantity,
     price: isUsBuy ? seedUsdFromKrw(buy.priceKrwPerShare) : buy.priceKrwPerShare,
     totalAmount: amountInKrw,
     ...(preset?.ticker ? { ticker: preset.ticker } : {}),
@@ -3282,7 +3441,7 @@ async function upsertInitialSeedCustomAsset(
   const region: AssetMarket = isForeignPresetName(name)
     ? 'US'
     : inferAssetMarketRegion(name, type);
-  const displayCurrency = getDefaultDisplayCurrency(region);
+  const displayCurrency = region === 'Crypto' ? 'CRYPTO' : getDefaultDisplayCurrency(region);
   const docId = resolveSeedAssetDocId(name);
   const priceUsd = displayCurrency === 'USD' ? seedUsdFromKrw(buy.priceKrwPerShare) : undefined;
 
@@ -3321,7 +3480,7 @@ async function seedSingleInitialPortfolio(
   );
   const catalogPrices = buildCatalogPriceMap([], INITIAL_SEED_EXCHANGE_RATE);
   const buyTotalKrw = config.buys.reduce(
-    (sum, buy) => sum + buy.priceKrwPerShare * buy.quantity,
+    (sum, buy) => sum + resolveSeedBuyAmountKrw(buy),
     0
   );
   const portfolioValues = updatePortfolioValues(
@@ -3359,7 +3518,7 @@ async function seedSingleInitialPortfolio(
   );
 }
 
-/** logicalName: initialPortfolioDataV1_2026-05-29 — 4명 초기 포트폴리오 + customAssets 일괄 입력 */
+/** logicalName: initialPortfolioDataV1_2026-05-29 — 8명 초기 포트폴리오 + customAssets 일괄 입력 */
 export async function seedInitialPortfolios20260529(): Promise<{
   success: boolean;
   message: string;
@@ -3444,13 +3603,17 @@ export const REFERENCE_PURCHASE_PRICES_KRW_20260529: Record<string, number> = {
   엔비디아: 316_710,
   팔란티어: 234_810,
   SPY: 1_134_720,
+  QQQ: 1_100_000,
   SCHD: 48_750,
   시놉시스: 713_430,
   TSMC: 627_675,
   VOO: 1_043_235,
   ASML: 2_419_500,
   GLD: 625_215,
-  '노키아 ADR': 22_380,
+  '노키아 ADR': 23_000,
+  'TIGER S&P500 ETF': 28_300,
+  비트코인: 162_000_000,
+  테슬라: 653_685,
   록히드마틴: 796_755,
   '루멘텀 홀딩스': 1_275_000,
   브룩필드: 68_385,
@@ -3918,11 +4081,7 @@ const PRICE_UPDATES_20260613: Record<string, number> = {
   SK하이닉스: 2_150_000,
   삼성전자: 322_500,
   현대차: 607_000,
-  두산에너빌리티: 106_805,
-  LG화학: 358_000,
-  NAVER: 212_000,
-  카카오: 45_800,
-  셀트리온: 189_500,
+  두산에너빌리티: 93_100,
   'TIGER 반도체TOP10': 53_000,
   'KODEX 미국S&P500': 25_420,
   'KODEX 미국나스닥100': 29_645,
@@ -3940,7 +4099,7 @@ const PRICE_UPDATES_20260613: Record<string, number> = {
   TSMC: 423.93,
   테슬라: 420.0,
   ASML: 1_863.55,
-  '노키아 ADR': 14.08,
+  '노키아 ADR': 14.80,
   록히드마틴: 540.33,
   '루멘텀 홀딩스': 921.56,
   브룩필드: 45.21,
@@ -3948,6 +4107,8 @@ const PRICE_UPDATES_20260613: Record<string, number> = {
   SPY: 741.75,
   SCHD: 32.82,
   VOO: 681.95,
+  QQQ: 717.12,
+  'TIGER S&P500 ETF': 27_880,
   GLD: 386.54,
 };
 
@@ -4099,4 +4260,5 @@ if (typeof window !== 'undefined') {
   window.updateAssetPricesForSession = updateAssetPricesForSession;
   window.recalculateAllPortfolios = recalculateAllPortfolios;
   window.fixMicronTeslaMarketRegionInFirestore = fixMicronTeslaMarketRegionInFirestore;
+  window.seedInitialPortfolios20260529 = seedInitialPortfolios20260529;
 }
