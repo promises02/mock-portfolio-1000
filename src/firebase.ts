@@ -1903,7 +1903,7 @@ export function computeRealizedProfitOnSell(
   };
 }
 
-/** logicalName: accurateProfitCalculationV2_withExchangeRate — 포트폴리오 평가·손익 일괄 계산 */
+/** logicalName: accurateProfitCalculationV2_withExchangeRate — 제거됨 (Gemini 데이터 기반) */
 export function updatePortfolioValues(
   assets: AssetItem[],
   savings: number,
@@ -1912,53 +1912,10 @@ export function updatePortfolioValues(
   exchangeRate: number,
   catalogPrices?: CatalogPriceMap
 ): PortfolioValueUpdate {
-  let totalCurrentValue = 0;
-  let totalPurchaseAmountKRW = 0;
-  let totalUnrealizedProfit = 0;
-
-  const normalizedAssets = assets.map((asset) =>
-    isUsMarketAsset(asset) ? normalizeUsAssetPurchaseBasis(asset, exchangeRate) : asset
+  throw new Error(
+    '❌ updatePortfolioValues는 더 이상 사용되지 않습니다.\n' +
+    'Gemini 계산 기반 데이터를 Firestore에 저장하고 조회하는 시스템으로 전환되었습니다.'
   );
-
-  const updatedAssets = normalizedAssets.map((asset) => {
-    const profitInfo = calculateUnrealizedProfit(
-      asset,
-      marketPrices,
-      exchangeRate,
-      catalogPrices
-    );
-    totalCurrentValue += profitInfo.currentAmount;
-    totalUnrealizedProfit += profitInfo.unrealizedProfit;
-    totalPurchaseAmountKRW += profitInfo.purchaseAmount;
-
-    return stripUndefinedDeep({
-      ...asset,
-      unrealizedProfit: profitInfo.unrealizedProfit,
-      unrealizedProfitRate: profitInfo.unrealizedProfitRate,
-      totalPurchaseAmount: profitInfo.purchaseAmount,
-    });
-  });
-
-  const roundedEvaluation = Math.round(totalCurrentValue);
-  const roundedSavings = Math.round(savings);
-  const totalAssets = roundedSavings + roundedEvaluation;
-  const totalProfitAmountFromNav = totalAssets - initialCapital;
-  const profitRate =
-    totalPurchaseAmountKRW > 0 ? (totalUnrealizedProfit / totalPurchaseAmountKRW) * 100 : 0;
-
-  return {
-    assets: updatedAssets,
-    totalCurrentValue: roundedEvaluation,
-    profitAmount: Math.round(totalUnrealizedProfit),
-    profitRate,
-    totalAssets,
-    totalProfitAmount: totalProfitAmountFromNav,
-    totalProfitRate:
-      initialCapital > 0 ? (totalProfitAmountFromNav / initialCapital) * 100 : 0,
-    totalPurchaseAmount: Math.round(totalPurchaseAmountKRW),
-    totalUnrealizedProfit: Math.round(totalUnrealizedProfit),
-    totalRealizedProfit: 0,
-  };
 }
 
 /** 종합 실질 수익률: (현금 + 평가금액) − 초기자본 */
